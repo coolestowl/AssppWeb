@@ -128,7 +128,7 @@
       "preparingAssets": "서명 구성 요소 준비 중 {{percent}}%",
       "preparingSigner": "서명자 초기화 중…",
       "signerFailed": "서명 구성 요소 준비 실패: {{error}}",
-      "signerFirstRun": "처음 한 번만 서명 구성 요소를 준비합니다(약 14 MB).",
+      "signerFirstRun": "처음 한 번만 서명 구성 요소를 준비합니다(약 12 MB).",
       "retrySignIn": "로그인 재시도"
     },
     "detail": {
@@ -154,6 +154,13 @@
     }
   },
   "downloads": {
+    "progress": {
+      "preparing": "다운로드 구성 요소를 준비하고 있습니다…",
+      "preparingLabel": "다운로드 구성 요소를 준비하고 있습니다",
+      "initializing": "다운로드 구성 요소를 초기화하고 있습니다…",
+      "connecting": "App Store에 연결하고 있습니다…",
+      "confirming": "다운로드 정보를 확인하고 있습니다…"
+    },
     "title": "다운로드",
     "warning": "패키지는 임시 저장되며 서버 재시작 시 삭제됩니다. 즉시 다운로드하거나 설치하세요.",
     "warningShort": "임시 보관 · 재시작 시 삭제 · 즉시 저장하세요.",
@@ -161,11 +168,11 @@
     "emptyAll": "다운로드가 없습니다.",
     "emptyAllDesc": "다운로드 대기열이 비어 있습니다. 검색 페이지로 이동하여 필요한 앱을 탐색하고 다운로드하세요.",
     "emptyAllDescShort": "다운로드가 없습니다. 검색에서 앱을 찾아보세요.",
-    "emptyFilter": "{{status}} 상태의 다운로드가 없습니다.",
-    "emptyFilterDesc": "이 상태와 일치하는 다운로드 기록이 없습니다.",
-      "filter": "필터",
-      "statusWithCount": "{{status}} ({{count}})",
-      "filterActive": "진행 중",
+    "emptyFilter": "{{account}} 계정의 다운로드가 없습니다.",
+    "emptyFilterDesc": "이 계정과 일치하는 다운로드 기록이 없습니다.",
+    "accountFilter": "계정별 필터",
+    "accountWithCount": "{{account}} ({{count}})",
+    "allAccounts": "모든 계정",
     "searchApps": "다운로드할 앱 검색",
     "deleteConfirm": "이 다운로드를 삭제하시겠습니까?",
     "deletePrompt": "{{appName}}을(를) 삭제하시겠습니까? 이 작업은 되돌릴 수 없으며 패키지가 서버에서 삭제됩니다.",
@@ -494,6 +501,7 @@
     "auth": {
       "requiresVerification": "2단계 인증 코드가 필요합니다. 인증 코드 팝업이 뜨지 않으면 https://account.apple.com 에 로그인하여 알림을 트리거한 후 2FA 코드 필드에 입력하세요.",
       "verificationIncomplete": "Apple이 인증을 완료하지 못했습니다. 코드를 새로 받아 다시 입력하세요.",
+      "invalidCode": "2단계 인증 코드는 숫자 6자리여야 합니다.",
       "redirectLocation": "리디렉션 주소를 가져올 수 없습니다",
       "redirectHost": "Apple의 리디렉션이 Apple 도메인 밖을 가리켜 따르지 않았습니다",
       "emptyBody": "인증 실패: 서버가 빈 본문과 함께 HTTP {{status}}를 반환했습니다",

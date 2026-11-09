@@ -25,9 +25,20 @@ export class PackagePlatformError extends Error {
 
 /**
  * Infers the platform a package targets from its `CFBundleSupportedPlatforms`. A universal
- * app lists several; the first non-iPhoneOS entry distinguishes tvOS (`AppleTVOS`) and
- * visionOS (`XROS`); only `iPhoneOS` means an iOS/iPad build. `.pkg` (xar) never reaches this.
+ * app lists several; the first non-iPhoneOS entry distinguishes tvOS (`AppleTVOS`),
+ * watchOS (`WatchOS`) and visionOS (`XROS`); only `iPhoneOS` means an iOS/iPad build.
+ * `.pkg` (xar) never reaches this.
  */
+export function supportedPlatformsFromPlist(
+  infoPlist: Record<string, unknown> | null,
+): string[] {
+  const supported = infoPlist?.CFBundleSupportedPlatforms;
+  if (!Array.isArray(supported)) return [];
+  return supported
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter((value) => value !== "");
+}
+
 export function platformFromSupported(
   infoPlist: Record<string, unknown> | null,
 ): Platform | undefined {
@@ -37,18 +48,21 @@ export function platformFromSupported(
 
   if (supported.includes("XROS")) return "visionos";
   if (supported.includes("AppleTVOS")) return "tvos";
+  if (supported.includes("WatchOS")) return "watchos";
   if (supported.includes("iPhoneOS")) return "ios";
   return undefined;
 }
 
 /**
- * Validates that the downloaded IPA declares support for at least one known platform in its
- * `CFBundleSupportedPlatforms`, returning that platform so the caller can correct the task
- * when the request's was wrong (e.g. a tvOS version id pinned with the selector on iOS).
- * Throws {@link PackagePlatformError} when none is declared.
+ * Validates the downloaded IPA's declared platform, returning what the package says so a
+ * caller can correct a wrong request platform (e.g. a tvOS version id pinned with the
+ * selector on iOS). Legacy iOS/iPad packages may predate `CFBundleSupportedPlatforms`;
+ * only a wholly missing field is accepted for those platforms. An empty, malformed or
+ * conflicting declaration still fails. Throws {@link PackagePlatformError} otherwise.
  */
 export async function validatePackagePlatform(
   ipaPath: string,
+  expectedPlatform?: Platform,
 ): Promise<Platform | undefined> {
   const zip = await openZip(ipaPath);
   try {
@@ -59,6 +73,17 @@ export async function validatePackagePlatform(
       const data = await streamToBuffer(stream);
       const info = parsePlistBuffer(data);
       if (!info) continue;
+
+      const hasSupportedPlatforms = Object.prototype.hasOwnProperty.call(
+        info,
+        "CFBundleSupportedPlatforms",
+      );
+      if (
+        !hasSupportedPlatforms &&
+        (expectedPlatform === "ios" || expectedPlatform === "ipad")
+      ) {
+        return expectedPlatform;
+      }
 
       const platform = platformFromSupported(info);
       if (platform) return platform;

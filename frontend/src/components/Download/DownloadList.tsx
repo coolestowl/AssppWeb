@@ -13,7 +13,6 @@ import {
   previewDownloadTasks,
 } from "./previewTasks";
 import { useDownloads } from "../../hooks/useDownloads";
-import { isActiveDownload } from "../../store/downloads";
 import { useAccounts } from "../../hooks/useAccounts";
 import {
   useDownloadAction,
@@ -22,26 +21,19 @@ import {
 import { useVersionMetadataMap } from "../../hooks/useVersionMetadata";
 import { useToastStore } from "../../store/toast";
 import { lookupApp } from "../../api/search";
+import { accountSelectLabel } from "../../utils/account";
 import { getErrorMessage } from "../../utils/error";
 import { getAccountContext } from "../../utils/toast";
 import { isNewerVersion } from "../../utils/version";
 import { versionRowLabel } from "../../utils/versionLabels";
 import { needsVersionExchange } from "../../utils/software";
 import { storeIdToCountry } from "../../apple/config";
+import type { DownloadExchangeProgress } from "../../apple/sap/client";
+import InlineProgressStatus from "../common/InlineProgressStatus";
 import type { Account, DownloadTask, Software } from "../../types";
 
-/**
- * What the filter picks. `active` is the Downloads badge's bucket (queued,
- * transferring, compiling), not a status the rest of the UI treats separately.
- */
-type StatusFilter = "all" | "active" | "paused" | "completed" | "failed";
-
-/** Whether a task belongs to a filter pick. */
-function matchesFilter(task: DownloadTask, pick: StatusFilter): boolean {
-  if (pick === "all") return true;
-  if (pick === "active") return isActiveDownload(task);
-  return task.status === pick;
-}
+/** The account filter's sentinel; every other value is an account hash. */
+const ALL_ACCOUNTS_FILTER = "all";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -104,7 +96,9 @@ async function checkForUpdate(
     account: Account,
     app: Software,
     recordedVersionId?: string,
+    onStage?: (progress: DownloadExchangeProgress | null) => void,
   ) => Promise<ServableVersion | undefined>,
+  onStage?: (progress: DownloadExchangeProgress | null) => void,
 ): Promise<UpdateCheck> {
   // The platform travels with the lookup: the backend answers a delisted app per
   // platform, else an id search would only see the iOS build (see `lookupEntityFor`).
@@ -120,6 +114,7 @@ async function checkForUpdate(
       account,
       app,
       task.software.externalVersionId,
+      onStage,
     );
     if (!newest) return { status: "unknown" };
     const newer = isNewerServable(newest, task);
@@ -158,7 +153,7 @@ export default function DownloadList() {
     (location.state as { highlightTaskId?: string } | null)?.highlightTaskId ??
     null;
   const [highlightId, setHighlightId] = useState<string | null>(hoppedTaskId);
-  const [filter, setFilter] = useState<StatusFilter>("all");
+  const [filter, setFilter] = useState(ALL_ACCOUNTS_FILTER);
   const addToast = useToastStore((s) => s.addToast);
   const { accounts } = useAccounts();
   const {
@@ -192,6 +187,14 @@ export default function DownloadList() {
     selected: string;
   } | null>(null);
   const [updating, setUpdating] = useState(false);
+  const [retryStage, setRetryStage] = useState<{
+    id: string;
+    progress: DownloadExchangeProgress | null;
+  } | null>(null);
+  const [checkUpdateProgress, setCheckUpdateProgress] =
+    useState<DownloadExchangeProgress | null>(null);
+  const [updateProgress, setUpdateProgress] =
+    useState<DownloadExchangeProgress | null>(null);
 
   useEffect(() => {
     return () => {
@@ -199,7 +202,22 @@ export default function DownloadList() {
     };
   }, []);
 
-  const filtered = displayTasks.filter((task) => matchesFilter(task, filter));
+  const filtered = displayTasks.filter(
+    (task) => filter === ALL_ACCOUNTS_FILTER || task.accountHash === filter,
+  );
+
+  // An account can disappear while its pick is selected. Keep the pick while its
+  // records are still here, then fall back to the full list once neither remains.
+  useEffect(() => {
+    if (filter === ALL_ACCOUNTS_FILTER) return;
+    if (
+      hashToEmail[filter] ||
+      displayTasks.some((task) => task.accountHash === filter)
+    ) {
+      return;
+    }
+    setFilter(ALL_ACCOUNTS_FILTER);
+  }, [displayTasks, filter, hashToEmail]);
 
   // Take the hop off the entry that carried it; a reload or step back must find
   // the list unmarked.
@@ -235,26 +253,50 @@ export default function DownloadList() {
     return timeB - timeA;
   });
 
-  /** The pick's own name: the group has one, the raw statuses keep theirs. */
-  const filterLabel = (pick: StatusFilter) =>
-    pick === "active"
-      ? t("downloads.filterActive")
-      : t(`downloads.status.${pick}`);
-
-  /** How many tasks a pick holds — `全部` included. */
-  const statusCount = (pick: StatusFilter) =>
-    displayTasks.filter((task) => matchesFilter(task, pick)).length;
-
-  /** The filter's menu: `全部` first, then the four ways a task can sit. */
-  const filterOptions = (
-    ["all", "active", "paused", "completed", "failed"] as StatusFilter[]
-  ).map((pick) => ({
-    value: pick,
-    label: t("downloads.statusWithCount", {
-      status: filterLabel(pick),
-      count: statusCount(pick),
+  /**
+   * Accounts the menu offers, by their download key. Current accounts come first
+   * in account-store order; a task whose account is no longer in the store (or a
+   * design-preview task) still gets its own pick rather than becoming unfilterable.
+   */
+  const accountFilterEntries = [
+    ...Object.entries(hashToEmail).map(([hash, email]) => {
+      const account = accounts.find((item) => item.email === email);
+      return {
+        value: hash,
+        label: account ? accountSelectLabel(account, t) : email,
+      };
     }),
-  }));
+    ...Array.from(new Set(displayTasks.map((task) => task.accountHash)))
+      .filter((hash) => !hashToEmail[hash])
+      .map((hash) => ({ value: hash, label: hash })),
+  ];
+
+  const accountTaskCount = (hash: string) =>
+    displayTasks.filter((task) => task.accountHash === hash).length;
+
+  const filterLabel = (pick: string) =>
+    pick === ALL_ACCOUNTS_FILTER
+      ? t("downloads.allAccounts")
+      : (accountFilterEntries.find((entry) => entry.value === pick)?.label ??
+        pick);
+
+  /** The filter's menu: all accounts first, then one pick per account. */
+  const filterOptions = [
+    {
+      value: ALL_ACCOUNTS_FILTER,
+      label: t("downloads.accountWithCount", {
+        account: filterLabel(ALL_ACCOUNTS_FILTER),
+        count: displayTasks.length,
+      }),
+    },
+    ...accountFilterEntries.map(({ value, label }) => ({
+      value,
+      label: t("downloads.accountWithCount", {
+        account: label,
+        count: accountTaskCount(value),
+      }),
+    })),
+  ];
 
   /** The account a task was downloaded with, as this list knows it. */
   const taskOwner = (task: DownloadTask) =>
@@ -344,10 +386,14 @@ export default function DownloadList() {
         account,
         task.software,
         task.software.externalVersionId || undefined,
+        undefined,
+        (progress) => setRetryStage({ id, progress }),
       );
     } catch (err) {
       toastDownloadError(account, task.software, err);
       return;
+    } finally {
+      setRetryStage(null);
     }
 
     try {
@@ -381,6 +427,7 @@ export default function DownloadList() {
         task,
         country,
         lookupNewestServableVersion,
+        setCheckUpdateProgress,
       );
 
       // A check that could not be made is not an answer — report failure, not "already latest".
@@ -396,7 +443,12 @@ export default function DownloadList() {
       // The storefront path opens on the exchange's list; the exchange path already carries it.
       const versions =
         found.versions ??
-        (await listVersionsWithLicense(account, found.app)).versions;
+        (await listVersionsWithLicense(
+          account,
+          found.app,
+          undefined,
+          setCheckUpdateProgress,
+        )).versions;
       setUpdateTarget({
         task,
         app: found.app,
@@ -409,6 +461,7 @@ export default function DownloadList() {
     } catch {
       addToast(t("downloads.package.checkUpdateFailed"), "error");
     } finally {
+      setCheckUpdateProgress(null);
       setCheckingUpdateId(null);
     }
   }
@@ -439,12 +492,19 @@ export default function DownloadList() {
       // refused as a duplicate, so the row must stay — nothing replaced that package.
       const picksHeldBuild =
         selected !== "" && selected === (task.software.externalVersionId ?? "");
-      await startDownload(account, app, pin || undefined);
+      await startDownload(
+        account,
+        app,
+        pin || undefined,
+        undefined,
+        setUpdateProgress,
+      );
       if (!picksHeldBuild) await deleteDownload(task.id);
       setUpdateTarget(null);
     } catch {
       addToast(t("downloads.package.updateFailed"), "error");
     } finally {
+      setUpdateProgress(null);
       setUpdating(false);
     }
   }
@@ -533,12 +593,12 @@ export default function DownloadList() {
         </button>
       </div>
 
-      <div className="mb-5 min-w-0 sm:max-w-xs">
+      <div className="mb-5 min-w-0 sm:max-w-md">
         <Select
           value={filter}
-          onChange={(next) => setFilter(next as StatusFilter)}
+          onChange={setFilter}
           options={filterOptions}
-          ariaLabel={t("downloads.filter")}
+          ariaLabel={t("downloads.accountFilter")}
           className="h-9 w-full min-w-0 rounded-full bg-white px-3 text-sm font-medium text-gray-700 ring-1 ring-black/5 transition-colors hover:bg-gray-50 dark:bg-gray-900 dark:text-gray-200 dark:ring-white/10 dark:hover:bg-gray-800"
         />
       </div>
@@ -599,24 +659,24 @@ export default function DownloadList() {
             </svg>
           </div>
           <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2 text-center">
-            {filter === "all"
+            {filter === ALL_ACCOUNTS_FILTER
               ? t("downloads.emptyAll")
-              : t("downloads.emptyFilter", { status: filterLabel(filter) })}
+              : t("downloads.emptyFilter", { account: filterLabel(filter) })}
           </h3>
           <p
             className="mb-6 max-w-full overflow-hidden text-center text-gray-500 dark:text-gray-400"
             aria-label={
-              filter === "all"
+              filter === ALL_ACCOUNTS_FILTER
                 ? t("downloads.emptyAllDesc")
                 : t("downloads.emptyFilterDesc")
             }
             title={
-              filter === "all"
+              filter === ALL_ACCOUNTS_FILTER
                 ? t("downloads.emptyAllDesc")
                 : t("downloads.emptyFilterDesc")
             }
           >
-            {filter === "all" ? (
+            {filter === ALL_ACCOUNTS_FILTER ? (
               <>
                 <span
                   aria-hidden="true"
@@ -637,7 +697,7 @@ export default function DownloadList() {
               </span>
             )}
           </p>
-          {filter === "all" && (
+          {filter === ALL_ACCOUNTS_FILTER && (
             <Link
               to="/search"
               className="inline-flex min-h-11 items-center gap-2 rounded-full bg-blue-600 px-6 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-700"
@@ -676,6 +736,13 @@ export default function DownloadList() {
                 onRetry={owner ? handleRetry : undefined}
                 onCheckUpdate={owner ? handleCheckUpdate : undefined}
                 checkingUpdate={checkingUpdateId === task.id}
+                actionProgress={
+                  task.id === checkingUpdateId
+                    ? checkUpdateProgress
+                    : task.id === retryStage?.id
+                      ? retryStage.progress
+                      : null
+                }
                 onDelete={handleDelete}
               />
             );
@@ -761,6 +828,7 @@ export default function DownloadList() {
               />
             </div>
           )}
+          <InlineProgressStatus progress={updateProgress} />
           <div className="mt-6 grid min-w-0 grid-cols-2 gap-2">
             <button
               type="button"

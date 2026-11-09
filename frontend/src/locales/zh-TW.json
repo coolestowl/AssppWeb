@@ -128,7 +128,7 @@
       "preparingAssets": "正在準備簽署元件 {{percent}}%",
       "preparingSigner": "正在初始化簽署器…",
       "signerFailed": "簽署元件準備失敗：{{error}}",
-      "signerFirstRun": "首次使用需準備簽名元件（約 14 MB），僅此一次。",
+      "signerFirstRun": "首次使用需準備簽名元件（約 12 MB），僅此一次。",
       "retrySignIn": "重試登入"
     },
     "detail": {
@@ -154,6 +154,13 @@
     }
   },
   "downloads": {
+    "progress": {
+      "preparing": "正在準備下載元件…",
+      "preparingLabel": "正在準備下載元件",
+      "initializing": "正在初始化下載元件…",
+      "connecting": "正在連接 App Store…",
+      "confirming": "正在確認下載資訊…"
+    },
     "title": "下載",
     "warning": "安裝包是暫時的，將在伺服器重啟時被清除。請及時下載或安裝。",
     "warningShort": "暫存安裝包，重啟即清除，請及時保存。",
@@ -161,11 +168,11 @@
     "emptyAll": "暫無下載。",
     "emptyAllDesc": "您的下載佇列為空。前往搜尋頁面探索並下載您需要的應用程式吧。",
     "emptyAllDescShort": "下載佇列為空，請前往搜尋頁面取得應用程式。",
-    "emptyFilter": "暫無{{status}}下載。",
-    "emptyFilterDesc": "沒有符合該狀態的下載記錄。",
-      "filter": "篩選",
-      "statusWithCount": "{{status}} ({{count}})",
-      "filterActive": "進行中",
+    "emptyFilter": "暫無 {{account}} 的下載。",
+    "emptyFilterDesc": "沒有符合該帳號的下載記錄。",
+    "accountFilter": "依帳號篩選",
+    "accountWithCount": "{{account}} ({{count}})",
+    "allAccounts": "全部帳號",
     "searchApps": "搜尋要下載的應用程式",
     "deleteConfirm": "刪除此下載？",
     "deletePrompt": "確定要刪除 {{appName}} 嗎？此操作無法撤銷，安裝包將從伺服器刪除。",
@@ -494,6 +501,7 @@
     "auth": {
       "requiresVerification": "驗證需要雙重認證代碼。如果沒有彈出驗證碼，請嘗試在 https://account.apple.com 登入以觸發提示，然後在雙重認證代碼欄位中填寫該代碼。",
       "verificationIncomplete": "Apple 未完成驗證。請重新取得驗證碼並填寫最新的那一個。",
+      "invalidCode": "雙重認證代碼必須正好包含 6 位數字。",
       "redirectLocation": "無法取得重新導向位址",
       "redirectHost": "Apple 的重新導向指向非 Apple 網域，因此未跟隨",
       "emptyBody": "認證失敗：伺服器傳回 HTTP {{status}} 且回應主體為空",

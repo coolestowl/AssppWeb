@@ -128,7 +128,7 @@
       "preparingAssets": "正在准备签名组件 {{percent}}%",
       "preparingSigner": "正在初始化签名器…",
       "signerFailed": "签名组件准备失败：{{error}}",
-      "signerFirstRun": "首次使用需准备签名组件（约 14 MB），仅此一次。",
+      "signerFirstRun": "首次使用需准备签名组件（约 12 MB），仅此一次。",
       "retrySignIn": "重试登录"
     },
     "detail": {
@@ -154,6 +154,13 @@
     }
   },
   "downloads": {
+    "progress": {
+      "preparing": "正在准备下载组件…",
+      "preparingLabel": "正在准备下载组件",
+      "initializing": "正在初始化下载组件…",
+      "connecting": "正在连接 App Store…",
+      "confirming": "正在确认下载信息…"
+    },
     "title": "下载",
     "warning": "安装包是临时的，将在服务器重启时被清除。请及时下载或安装。",
     "warningShort": "临时安装包，重启即清除，请及时保存。",
@@ -161,11 +168,11 @@
     "emptyAll": "暂无下载。",
     "emptyAllDesc": "您的下载队列为空。前往搜索页面探索并下载您需要的应用吧。",
     "emptyAllDescShort": "下载队列为空，请前往搜索页面获取应用。",
-    "emptyFilter": "暂无{{status}}下载。",
-    "emptyFilterDesc": "没有符合该状态的下载记录。",
-      "filter": "筛选",
-      "statusWithCount": "{{status}} ({{count}})",
-      "filterActive": "进行中",
+    "emptyFilter": "暂无 {{account}} 的下载。",
+    "emptyFilterDesc": "没有符合该账号的下载记录。",
+    "accountFilter": "按账号筛选",
+    "accountWithCount": "{{account}} ({{count}})",
+    "allAccounts": "全部账号",
     "searchApps": "搜索要下载的应用",
     "deleteConfirm": "删除此下载？",
     "deletePrompt": "确定要删除 {{appName}} 吗？此操作无法撤销，安装包将从服务器删除。",
@@ -494,6 +501,7 @@
     "auth": {
       "requiresVerification": "验证需要双重认证代码。如果没有弹出验证码，请尝试在 https://account.apple.com 登录以触发提示，然后在双重认证代码字段中填写该代码。",
       "verificationIncomplete": "Apple 未完成验证。请重新获取验证码并填写最新的那一个。",
+      "invalidCode": "双重认证代码必须正好包含 6 位数字。",
       "redirectLocation": "无法获取重定向地址",
       "redirectHost": "Apple 的重定向指向非 Apple 域名，因此未跟随",
       "emptyBody": "认证失败：服务器返回 HTTP {{status}} 且响应体为空",

@@ -52,6 +52,7 @@ describe("package download name", () => {
       ios: "Example_1.0_iOS.ipa",
       ipad: "Example_1.0_iPadOS.ipa",
       tvos: "Example_1.0_tvOS.ipa",
+      watchos: "Example_1.0_watchOS.ipa",
       visionos: "Example_1.0_visionOS.ipa",
     };
     for (const [platform, expected] of Object.entries(names)) {
@@ -211,6 +212,27 @@ describe("Downloads Route", () => {
       expect(res.status).toBe(400);
       expect(res.body.error).toContain("sinfs");
     }
+  });
+
+  it("POST /api/downloads should refuse a malformed md5", async () => {
+    const base = {
+      software: {
+        id: 1492142120,
+        bundleID: "com.example.utility",
+        name: "Example",
+        version: "1.0",
+      },
+      accountHash: "abcdef1234567890",
+      downloadURL: "https://example.apple.com/app.ipa",
+      sinfs: [],
+    };
+
+    const res = await request(app)
+      .post("/api/downloads")
+      .send({ ...base, md5: "not-a-digest" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("md5");
   });
 
   it("POST /api/downloads should refuse a mistyped software field or metadata", async () => {

@@ -215,6 +215,124 @@ describe("useDownloadAction", () => {
     expect(retryAccount.passwordToken).toBe("fresh-token");
   });
 
+  it("renews an expired password token and retries the download once", async () => {
+    vi.mocked(getDownloadInfo)
+      .mockRejectedValueOnce(new DownloadError("expired", "2034"))
+      .mockResolvedValueOnce({ output, updatedCookies: [] });
+
+    const { result } = renderHook(() => useDownloadAction());
+    await act(async () => {
+      await result.current.startDownload(account, app);
+    });
+
+    expect(authenticate).toHaveBeenCalledWith(
+      account.email,
+      account.password,
+      undefined,
+      account.cookies,
+      account.deviceIdentifier,
+    );
+    expect(getDownloadInfo).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(getDownloadInfo).mock.calls[1][0].passwordToken).toBe(
+      "fresh-token",
+    );
+    expect(mocks.updateAccount).toHaveBeenLastCalledWith(
+      expect.objectContaining({ passwordToken: "fresh-token" }),
+    );
+    expect(apiPost).toHaveBeenCalledWith(
+      "/api/downloads",
+      expect.objectContaining({ accountHash: expect.any(String) }),
+    );
+  });
+
+  it("renews the session once when a version list reports it expired", async () => {
+    vi.mocked(listVersions)
+      .mockRejectedValueOnce(new DownloadError("expired", "2042"))
+      .mockResolvedValueOnce({ versions: ["333"], updatedCookies: [] });
+
+    const { result } = renderHook(() => useDownloadAction());
+    await act(async () => {
+      await result.current.listVersionsWithLicense(account, app);
+    });
+
+    expect(authenticate).toHaveBeenCalledTimes(1);
+    expect(listVersions).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(listVersions).mock.calls[1][0].passwordToken).toBe(
+      "fresh-token",
+    );
+    expect(mocks.updateAccount).toHaveBeenLastCalledWith(
+      expect.objectContaining({ passwordToken: "fresh-token" }),
+    );
+  });
+
+  it("does not renew a version list for failureType 1008", async () => {
+    vi.mocked(listVersions).mockRejectedValueOnce(
+      new DownloadError("device verification", "1008"),
+    );
+
+    const { result } = renderHook(() => useDownloadAction());
+    await act(async () => {
+      await expect(
+        result.current.listVersionsWithLicense(account, app),
+      ).rejects.toThrow("device verification");
+    });
+
+    expect(authenticate).not.toHaveBeenCalled();
+    expect(listVersions).toHaveBeenCalledTimes(1);
+  });
+
+  it("still renews a download for failureType 1008", async () => {
+    vi.mocked(getDownloadInfo)
+      .mockRejectedValueOnce(new DownloadError("device verification", "1008"))
+      .mockResolvedValueOnce({ output, updatedCookies: [] });
+
+    const { result } = renderHook(() => useDownloadAction());
+    await act(async () => {
+      await result.current.startDownload(account, app);
+    });
+
+    expect(authenticate).toHaveBeenCalledTimes(1);
+    expect(getDownloadInfo).toHaveBeenCalledTimes(2);
+  });
+
+  it("renews a download for failureType 5002", async () => {
+    vi.mocked(getDownloadInfo)
+      .mockRejectedValueOnce(new DownloadError("expired", "5002"))
+      .mockResolvedValueOnce({ output, updatedCookies: [] });
+
+    const { result } = renderHook(() => useDownloadAction());
+    await act(async () => {
+      await result.current.startDownload(account, app);
+    });
+
+    expect(authenticate).toHaveBeenCalledTimes(1);
+    expect(getDownloadInfo).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(getDownloadInfo).mock.calls[1][0].passwordToken).toBe(
+      "fresh-token",
+    );
+  });
+
+  it("keeps the renewed account when the retried download needs a license", async () => {
+    vi.mocked(getDownloadInfo)
+      .mockRejectedValueOnce(new DownloadError("expired", "2034"))
+      .mockRejectedValueOnce(new DownloadError("license", "9610"))
+      .mockResolvedValueOnce({ output, updatedCookies: [] });
+    vi.mocked(authenticate)
+      .mockResolvedValueOnce({ ...account, passwordToken: "fresh-token" })
+      .mockRejectedValueOnce(new Error("2FA required"));
+
+    const { result } = renderHook(() => useDownloadAction());
+    await act(async () => {
+      await result.current.startDownload(account, app);
+    });
+
+    expect(authenticate).toHaveBeenCalledTimes(2);
+    expect(purchaseApp).toHaveBeenCalledWith(
+      expect.objectContaining({ passwordToken: "fresh-token" }),
+      app,
+    );
+  });
+
   it("leaves a recalled record's per-build facts out of the request", async () => {
     // A record recalled from the package index describes the build it came from,
     // while the picker may serve another. The date is re-read from the arriving
@@ -291,7 +409,7 @@ describe("useDownloadAction", () => {
 
   it("does not purchase for unrelated failures", async () => {
     vi.mocked(getDownloadInfo).mockRejectedValueOnce(
-      new DownloadError("boom", "5002"),
+      new DownloadError("boom", "2001"),
     );
 
     const { result } = renderHook(() => useDownloadAction());
@@ -362,6 +480,28 @@ describe("useDownloadAction", () => {
 
     expect(purchaseApp).toHaveBeenCalledTimes(2);
     expect(apiPost).not.toHaveBeenCalled();
+  });
+
+  it("hands the server Apple's raw-package md5", async () => {
+    vi.mocked(getDownloadInfo).mockResolvedValue({
+      output: {
+        ...output,
+        md5: "0123456789abcdef0123456789abcdef",
+      },
+      updatedCookies: [],
+    });
+
+    const { result } = renderHook(() => useDownloadAction());
+    await act(async () => {
+      await result.current.startDownload(account, app);
+    });
+
+    expect(apiPost).toHaveBeenCalledWith(
+      "/api/downloads",
+      expect.objectContaining({
+        md5: "0123456789abcdef0123456789abcdef",
+      }),
+    );
   });
 
   it("downloads directly when a license already exists", async () => {
@@ -546,7 +686,7 @@ describe("useDownloadAction", () => {
       await result.current.startDownload(account, tvosApp);
     });
 
-    expect(getDownloadInfo).toHaveBeenCalledWith(account, tvosApp, "900");
+    expect(getDownloadInfo).toHaveBeenCalledWith(account, tvosApp, "900", expect.anything());
   });
 
   it("borrows the pin from the page's region when one is supplied", async () => {
@@ -560,7 +700,7 @@ describe("useDownloadAction", () => {
       await result.current.startDownload(account, tvosApp, undefined, "JP");
     });
 
-    expect(getDownloadInfo).toHaveBeenCalledWith(account, tvosApp, "900");
+    expect(getDownloadInfo).toHaveBeenCalledWith(account, tvosApp, "900", expect.anything());
   });
 
   it("lets an explicit version win over the cached one", async () => {
@@ -572,7 +712,7 @@ describe("useDownloadAction", () => {
       await result.current.startDownload(account, tvosApp, "800");
     });
 
-    expect(getDownloadInfo).toHaveBeenCalledWith(account, tvosApp, "800");
+    expect(getDownloadInfo).toHaveBeenCalledWith(account, tvosApp, "800", expect.anything());
   });
 
   it("passes no version when the platform needs no pin, cache or not", async () => {
@@ -585,7 +725,7 @@ describe("useDownloadAction", () => {
       await result.current.startDownload(account, app);
     });
 
-    expect(getDownloadInfo).toHaveBeenCalledWith(account, app, undefined);
+    expect(getDownloadInfo).toHaveBeenCalledWith(account, app, undefined, expect.anything());
   });
 
   it("passes no version when a pinned platform has no cached list", async () => {
@@ -596,7 +736,7 @@ describe("useDownloadAction", () => {
       await result.current.startDownload(account, tvosApp);
     });
 
-    expect(getDownloadInfo).toHaveBeenCalledWith(account, tvosApp, undefined);
+    expect(getDownloadInfo).toHaveBeenCalledWith(account, tvosApp, undefined, expect.anything());
   });
 
   it("reuses the borrowed pin for the retry after a purchase", async () => {
@@ -648,6 +788,27 @@ describe("useDownloadAction", () => {
     expect(versions).toEqual(["333"]);
     const titles = useToastStore.getState().toasts.map((toast) => toast.title);
     expect(titles).toContain("toast.title.licenseSuccess");
+  });
+
+  it("keeps the renewed account when the retried version list needs a license", async () => {
+    vi.mocked(listVersions)
+      .mockRejectedValueOnce(new DownloadError("expired", "2034"))
+      .mockRejectedValueOnce(new DownloadError("license", "9610"))
+      .mockResolvedValueOnce({ versions: ["333"], updatedCookies: [] });
+    vi.mocked(authenticate)
+      .mockResolvedValueOnce({ ...account, passwordToken: "fresh-token" })
+      .mockRejectedValueOnce(new Error("2FA required"));
+
+    const { result } = renderHook(() => useDownloadAction());
+    await act(async () => {
+      await result.current.listVersionsWithLicense(account, app);
+    });
+
+    expect(authenticate).toHaveBeenCalledTimes(2);
+    expect(purchaseApp).toHaveBeenCalledWith(
+      expect.objectContaining({ passwordToken: "fresh-token" }),
+      app,
+    );
   });
 
   it("propagates other version list failures", async () => {
@@ -723,7 +884,12 @@ describe("useDownloadAction", () => {
 
       // The list is pinned to the build already held — the only pin a delisted
       // app can still be reached through — and its newest entry is the answer.
-      expect(listVersions).toHaveBeenCalledWith(account, recalled, "222");
+      expect(listVersions).toHaveBeenCalledWith(
+        account,
+        recalled,
+        "222",
+        undefined,
+      );
       expect(found).toEqual({
         versionId: "333",
         displayVersion: "3.4.6",

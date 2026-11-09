@@ -15,6 +15,8 @@ import {
 import { useAccounts } from "../../hooks/useAccounts";
 import { useAccountHashes } from "../../hooks/useAccountHashes";
 import { useDownloadAction } from "../../hooks/useDownloadAction";
+import type { DownloadExchangeProgress } from "../../apple/sap/client";
+import InlineProgressStatus from "../common/InlineProgressStatus";
 import { useSelectedAccount } from "../../hooks/useSelectedAccount";
 import { useVersionMetadataMap } from "../../hooks/useVersionMetadata";
 import { useToastStore } from '../../store/toast';
@@ -120,6 +122,9 @@ export default function ProductDetail() {
   const [selectedVersion, setSelectedVersion] = useState("");
   const [versionsOpen, setVersionsOpen] = useState(false);
   const [checkingVersions, setCheckingVersions] = useState(false);
+  const [actionProgress, setActionProgress] =
+    useState<DownloadExchangeProgress | null>(null);
+  const [fetchingVersions, setFetchingVersions] = useState(false);
   const autoFetchVersionInfo = useSettingsStore((s) => s.autoFetchVersionInfo);
   const autoAcquireLicense = useSettingsStore((s) => s.autoAcquireLicense);
   const {
@@ -215,11 +220,12 @@ export default function ProductDetail() {
     : recordIsCurrent
       ? app?.fileSizeBytes
       : undefined;
-  const currentMinimumOs = heldBuild
-    ? heldBuild.software.minimumOsVersion
-    : recordIsCurrent
-      ? app?.minimumOsVersion ?? ""
-      : "";
+  // A package-read minimum OS belongs to the build on screen, just like its
+  // date; only fall back to the record when that record *is* this build.
+  const currentMinimumOs =
+    heldBuild?.software.minimumOsVersion ||
+    currentMeta?.minimumOsVersion ||
+    (recordIsCurrent ? app?.minimumOsVersion ?? "" : "");
   // A date may only come from a package read (`utils/versionLabels` prints only
   // those): the exchange dates the *app*, not the build. A held package's own
   // date is the one the version list shows; the record's is the recorded build's.
@@ -637,12 +643,14 @@ export default function ProductDetail() {
       return;
     }
     if (!account) return;
+    setFetchingVersions(true);
     setLoadingAction("versions");
     try {
       const result = await listVersionsWithLicense(
         account,
         app,
         routeVersionId || undefined,
+        setActionProgress,
       );
       rememberVersionList(
         versionListKey(app.id, app.platform, country),
@@ -652,6 +660,8 @@ export default function ProductDetail() {
     } catch (e) {
       addToast(getErrorMessage(e, t("search.versions.loadFailed")), "error");
     } finally {
+      setFetchingVersions(false);
+      setActionProgress(null);
       setLoadingAction(null);
     }
   }
@@ -688,10 +698,12 @@ export default function ProductDetail() {
         app,
         currentVersionId || undefined,
         country,
+        setActionProgress,
       );
     } catch (e) {
       toastDownloadError(account, app, e);
     } finally {
+      setActionProgress(null);
       setLoadingAction(null);
     }
   }
@@ -868,7 +880,8 @@ export default function ProductDetail() {
                 </span>
               </div>
             ) : (
-              <div className="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
+              <div className="space-y-2">
+              <div className="grid min-w-0 grid-cols-2 gap-2 lg:grid-cols-4 lg:gap-3">
               {(app.price === undefined || app.price === 0) &&
                 app.metadataSource !== "local" &&
                 app.metadataSource !== "bare" &&
@@ -954,6 +967,21 @@ export default function ProductDetail() {
                     <span>{t("search.product.checkVersionNumbers")}</span>
                   </button>
                 )}
+              </div>
+              {actionProgress ? (
+                <InlineProgressStatus progress={actionProgress} />
+              ) : (
+                isSelectingVersions &&
+                fetchingVersions && (
+                  <p
+                    role="status"
+                    aria-live="polite"
+                    className="min-h-4 text-xs text-gray-500 dark:text-gray-400"
+                  >
+                    {t("search.versions.fetching")}
+                  </p>
+                )
+              )}
               </div>
             )}
             {/* Why the download button is out: the account already holds the build it

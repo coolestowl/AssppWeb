@@ -68,8 +68,8 @@ Apple requires every request to the auth endpoint to carry `X-Apple-ActionSignat
 │      sign-sap-setup      → setup exchange endpoint (POST plist)   │
 │      sign-sap-setup-cert → certificate endpoint (GET plist)       │
 │      sign-sap-version    → protocol version (200)                 │
-│ 2. GET /api/sap-assets/:name → four Apple binaries (backend-     │
-│    extracted, digest-pinned, browser-cached in the Cache API)     │
+│ 2. GET /api/sap-assets/:name?sha256=<pin> → five Apple binaries  │
+│    (backend-extracted, digest-pinned, browser-cached)            │
 │ 3. SAP signer worker (Web Worker, off the UI thread):             │
 │      Unicorn 2.1.4 → TCI interpreter backend → wasm              │
 │      Mach-O x86_64 images loaded + dyld-info relocated in TS     │
@@ -85,9 +85,9 @@ Apple requires every request to the auth endpoint to carry `X-Apple-ActionSignat
 
 - `engine.ts` — Unicorn WASM wrapper; all guest addresses cross the JS boundary as doubles (exact below 2^53; the guest map stays below 2^48)
 - `machImage.ts` — Mach-O 64 parser: fat-binary slicing, LC_SEGMENT_64, symtab lookup, dyld_info rebase/bind/weak/lazy opcodes. **Opcode tables**: rebase uses nibbles 0x00–0x80 (SET_TYPE 0x10, SET_SEGMENT 0x20, …); bind is shifted down one slot (DO_BIND 0x90) because rebase-only ADD_ADDR_IMM_SCALED occupies bind's 0x90 slot elsewhere. Segment offsets move in uint64 BigInt space — bind ADD_ADDR_ULEB deltas are 64-bit encodings of negative steps. Fixups targeting a segment's BSS tail (within vmsize, past fileSize) are skipped: dyld would zero-fill them.
-- `shims.ts` — guest libc/CF/IOKit shims; 64-bit −1 constants are passed as `-1` (wasm's saturating f64→i64 conversion yields 0xFFFF…F, which a JS number cannot represent exactly)
-- `machine.ts` — entry-point invocation, scratch/stack layout, output disposal
-- `signer.ts` / `client.ts` / `worker.ts` — orchestration; emulation runs in a Web Worker, Apple network calls ride the wisp tunnel on the main thread. `client.ts` keeps the signer as a singleton bound to the deviceIdentifier (rebuilding it means copying the 22.5 MB asset bundle into a fresh worker), with a zustand store (`store/sap.ts`), a warmup hook (`hooks/useSapWarmup.ts`, fires once an account exists), and an inline progress indicator (`components/common/SapStatus.tsx`)
+- `shims.ts` — guest libc/CF/IOKit shims. POSIX `int -1` is written as `0xffffffff`; pointer sentinels use a separate non-zero f64-safe handle because guest addresses cross the wasm glue as doubles
+- `machine.ts` — entry-point invocation, scratch/stack layout, output disposal, and StoreAgent kbsync generation
+- `signer.ts` / `client.ts` / `worker.ts` — orchestration; emulation runs in a Web Worker, Apple network calls ride the wisp tunnel on the main thread. `client.ts` keeps the signer as a singleton bound to the deviceIdentifier (rebuilding it means copying the 25.1 MB asset bundle into a fresh worker), with a zustand store (`store/sap.ts`), a warmup hook (`hooks/useSapWarmup.ts`, fires once an account exists), and an inline progress indicator (`components/common/SapStatus.tsx`). `generateDownloadKBSync` opens a separate short-lived worker so StoreAgent starts from clean SAP state; concurrent callers share that run, and only a blob accepted by ent/download is cached for reuse. The signer worker intentionally does not load StoreAgent, and the kbsync worker intentionally does not initialize the signer: the two guest profiles must not share a machine
 - `protocol.ts` — certificate fetch + setup exchange (plist `<data>` round-trip via appleRequest)
 - `assets.ts` — asset download with progress, SHA-256 verification (stripped-file pins), Cache API persistence; accepts both thin and fat Mach-O payloads
 - `vendor/unicorn.mjs|.wasm` — prebuilt engine (regenerate via `frontend/scripts/unicorn-wasm-patch/build.sh`)
@@ -106,13 +106,13 @@ Build: `bash frontend/scripts/unicorn-wasm-patch/build.sh` (requires docker; ems
 
 ### Backend asset pipeline
 
-`backend/src/services/sapAssets.ts` extracts the four binaries once from Apple's public OSXUpd10.9.pkg: xar TOC parse → HTTP range download of the Payload tail (~380 MB) → bzip2 stream (with a synthetic `BZh9` header from a fixed offset) → cpio (odc and newc formats) → pinned SHA-256 verification → **fat-binary stripping to the x86_64 slice** (the emulated guest architecture; CoreFP ships as an i386+x86_64 universal, so this halves it) → cache under `DATA_DIR/sap-assets`. All data is public Apple content (same trust class as the bag proxy). Specs carry two pin sets: the original Apple digest verifies the extraction; the stripped digest (a deterministic function of the original) verifies what is served and what the browser downloads. Distribution sizes: 37.7 MB original → 22.5 MB stripped → ~14 MB on the wire with the route's gzip response. The bz2 stream is truncated mid-file, so the decoder can emit a late crc error after the wanted members are captured — the pipeline swallows it by design (an unhandled rejection would crash Node).
+`backend/src/services/sapAssets.ts` extracts the five binaries once from Apple's public OSXUpd10.9.pkg: xar TOC parse → HTTP range download of the Payload tail (~380 MB) → bzip2 stream (with a synthetic `BZh9` header from a fixed offset) → cpio (odc and newc formats) → pinned SHA-256 verification → **fat-binary stripping to the x86_64 slice** (the emulated guest architecture; CoreFP ships as an i386+x86_64 universal, so this halves it) → cache under `DATA_DIR/sap-assets`. All data is public Apple content (same trust class as the bag proxy). Specs carry two pin sets: the original Apple digest verifies the extraction; the stripped digest (a deterministic function of the original) verifies what is served and what the browser downloads. Distribution sizes: 40.3 MB original → 25.1 MB stripped → ~12.1 MB on the wire with the route's precompressed Brotli response (gzip remains the fallback). The bz2 stream is truncated mid-file, so the decoder can emit a late crc error after the wanted members are captured — the pipeline swallows it by design (an unhandled rejection would crash Node). The browser loads the five assets in parallel; Cache API entries are raw and independent of the HTTP representation.
 
-On startup `ensureSapAssets` prefers `DATA_DIR/sap-assets`, then seeds from the image-prebaked directory (`BUNDLED_SAP_ASSETS`, default `/opt/asspp/sap-assets`), and only then falls back to network extraction (the bzip2 decoder is imported lazily because cross-built images may lack a matching napi binary for the runtime arch — see Dockerfile). Routes (`backend/src/routes/sapAssets.ts`): `GET /api/sap-assets/status`, `POST /api/sap-assets/prepare`, `GET /api/sap-assets/:name` (gzip when accepted).
+On startup `ensureSapAssets` prefers `DATA_DIR/sap-assets`, then seeds from the image-prebaked directory (`BUNDLED_SAP_ASSETS`, default `/opt/asspp/sap-assets`), and only then falls back to network extraction (the bzip2 decoder is imported lazily because cross-built images may lack a matching napi binary for the runtime arch — see Dockerfile). Routes (`backend/src/routes/sapAssets.ts`): `GET /api/sap-assets/status`, `POST /api/sap-assets/prepare`, `GET /api/sap-assets/:name?sha256=<pin>` (Brotli when accepted, gzip fallback). The query must match the current pin, so neither the browser's HTTP cache nor the Cache API can serve bytes from a previous pin at the same URL. The extraction also writes a quality-11 Brotli sidecar (`<name>.br`); the route copies a missing sidecar from the image once, then serves it directly. An old image without sidecars falls back to gzip.
 
 ### Container image
 
-The Dockerfile prebakes the stripped SAP assets at build time (a `sap-assets` stage runs `backend/scripts/extract-sap-assets.mts`; Docker layer caching makes it a no-op on rebuilds). Release images ship the assets, so a fresh VPS serves them with zero network use. Build stages run on `$BUILDPLATFORM` (JS artifacts are platform-independent); the runtime image installs production deps per target platform because `yauzl-promise` → `@node-rs/crc32` ships prebuilt napi binaries per arch. Published platforms: `linux/amd64`, `linux/arm64`. **linux/386 is out**: official node images dropped it and `@node-rs/crc32` has no linux-ia32 build.
+The Dockerfile prebakes the stripped SAP assets and their Brotli sidecars at build time (a `sap-assets` stage runs `backend/scripts/extract-sap-assets.mts`; Docker layer caching makes it a no-op on rebuilds). Release images ship both, so a fresh VPS serves Brotli with zero network use. Build stages run on `$BUILDPLATFORM` (JS artifacts are platform-independent); the runtime image installs production deps per target platform because `yauzl-promise` → `@node-rs/crc32` ships prebuilt napi binaries per arch. Published platforms: `linux/amd64`, `linux/arm64`. **linux/386 is out**: official node images dropped it and `@node-rs/crc32` has no linux-ia32 build.
 
 ### SAP invariants
 
@@ -121,7 +121,7 @@ The Dockerfile prebakes the stripped SAP assets at build time (a `sap-assets` st
 - SAP session lifetime = the page session: the signer is a singleton per deviceIdentifier, reused across sign-in attempts (2FA retries included); switching accounts rebuilds it. Initialization ≈ 150–300 ms of emulation plus the setup exchange round-trips
 - Every call *into* the emulation is bounded at two minutes (`SAP_CALL_TIMEOUT_MS` in `client.ts`). Nothing else bounds them — they run before the Apple request they sign for, so the request's own 20 s timeout never sees them — and a Worker that stops answering would otherwise leave the sign-in button spinning with no way out. A timed-out call is **wedged**, not slow: the driver terminates the worker, refuses further calls and drops the cached signer, so a retry rebuilds instead of waiting another two minutes on the same dead emulation
 - A preparation that fails after its worker was created terminates that worker. The worker holds ~160 MB of wasm heap and nothing outside `runPreparation` can reach it, so a transient Apple 502 on the setup exchange (measured) must not leave one running per attempt
-- First login downloads ~14 MB over the wire (22.5 MB stripped assets, gzipped); a background warmup and inline progress line cover it. Release images prebake the assets, so the backend serves them instantly
+- First login downloads ~12 MB over the wire (25.1 MB stripped assets, precompressed with Brotli); the five files load in parallel, and a background warmup and inline progress line cover it. Release images prebake the assets, so the backend serves them instantly
 - The live bag currently returns the legacy `MZFinance` authenticate endpoint (see upstream PR discussion), so `normalizeAuthURL` only ever adds the trailing slash to it; all three advertised endpoints sit in the SAP-signed list — signing applies regardless
 
 ## Reference Implementation
@@ -170,11 +170,11 @@ The Wisp server validates target hosts via `hostname_whitelist` in `backend/src/
 - `buy.itunes.apple.com` — purchase endpoint
 - `init.itunes.apple.com` — bag endpoint
 - `/^p\d+-buy\.itunes\.apple\.com$/` — pod-based hosts
-- `downloaddispatch.itunes.apple.com` — download fallbacks: redownload (`/r/redownload`) and updateProduct (`/up/updateProduct`)
+- `downloaddispatch.itunes.apple.com` — download endpoints: ent/download (`/WebObjects/DownloadDispatch.woa/wa/ent/download`), redownload (`/r/redownload`) and updateProduct (`/up/updateProduct`)
 - `fpinit.itunes.apple.com` — SAP setup exchange endpoint (`sign-sap-setup`)
 - `s.mzstatic.com` — SAP certificate endpoint (`sign-sap-setup-cert`)
 - `uclient-api.itunes.apple.com` — storefront catalogue lookup, used to pin the external version id before the redownload fallback (ipatool does the same)
-- `apps.apple.com` — storefront product pages for the visionOS and macOS version lookups (`/{cc}/app/id{id}?platform=vision|mac`); public content, no credentials, but CORS-blocked so it rides the wisp tunnel
+- `apps.apple.com` — storefront product pages for visionOS/macOS version lookups (`/{cc}/app/id{id}?platform=vision|mac`) and the public iOS/iPad catalog fallback (`/api/apps/v1/catalog/{cc}/apps/{id}`); public content, no credentials, but CORS-blocked so it rides the wisp tunnel
 - Port restricted to `443` only
 - Direct IP targets blocked (`allow_direct_ip = false`)
 - Loopback IP targets blocked (`allow_loopback_ips = false`)
@@ -203,26 +203,52 @@ Both endpoints answer only with a **trailing slash** on their path — the bare 
 
 `frontend/src/apple/download.ts` mirrors ipatool's `sendDownloadProduct`
 (`pkg/appstore/appstore_download_product.go`). No single endpoint serves every
-account/app pair, so the flow walks three of them and only two reply shapes move
-it on:
+account/app pair, so the flow walks up to four of them:
 
-1. **volumeStore** — `p{ped}-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct?guid=`.
-   Primary. Names the version `externalVersionId`.
-2. **redownload** — the bag's `redownloadProduct` URL. Names the version `appExtVrsId`.
-3. **updateProduct** — the bag's `updateProduct` URL. Same version key as redownload.
+1. **ent/download** — the bag's `volumeStoreDownloadProduct` URL. Apple now
+   points this key at `downloaddispatch.itunes.apple.com/WebObjects/DownloadDispatch.woa/wa/ent/download`;
+   it needs a StoreAgent-generated `kbsync`, a pinned `externalVersionId`, and
+   is tried first when those are available. The request carries `X-Token`, so it
+   never follows redirects.
+2. **volumeStore** — `p{ped}-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct?guid=`.
+   Legacy primary. Names the version `externalVersionId`.
+3. **redownload** — the bag's `redownloadProduct` URL. Names the version `appExtVrsId`.
+4. **updateProduct** — the bag's `updateProduct` URL. Same version key as redownload.
+
+An ent/download miss falls through to the legacy chain. Version-pin guessing
+sets `legacyOnly` on its internal probes, so an unpinned guess cannot recursively
+ask for another pin through ent/download. Its reply is accepted only when exactly
+one item names the requested app, pinned version and bundle id and carries a
+non-empty package URL. A cached `kbsync` rejected by HTTP 403/500, a non-plist or
+empty reply, or a mismatched item is invalidated and retried once with a freshly
+generated blob; if that fresh attempt is also rejected, the flow falls back to the
+legacy chain, whose reply (including a structured failure) is the answer. A
+structured `failureType` / `customerMessage` is not a `kbsync` rejection: it
+leaves ent/download immediately for the legacy chain without invalidating the
+cached blob or generating a fresh one. Every ent/download error — including a
+structured session failure such as `2034` — is only that endpoint's answer, so it
+never outranks the legacy chain or becomes the error when the legacy transport is
+unavailable. `kbsync` generation failures and invalid bag URLs also fall back.
 
 Fallback triggers (the reply shapes are ipatool's; the transport trigger below is
 this project's addition):
 
 - volumeStore → redownload when the reply is **empty** (HTTP 200, no
   `failureType`, no `customerMessage`, no `songList` — the purchase receipt Apple
-  returns for an app the account does not own yet) or **unavailable** (HTTP 200,
-  no `failureType`, no items, `customerMessage` ending in "No Longer Available").
-- redownload → updateProduct when the request fails with an **empty HTTP 500**, or
-  when redownload answers with the same availability message. Only reached with a
-  pinned version id, since updateProduct needs one. ipatool gates this hop on the
-  platform as well (iOS/iPad/tvOS/macOS, tvOS since `acd9e7a`); this project does
-  not, so visionOS is served the same fallback.
+  returns for an app the account does not own yet), **unavailable** (HTTP 200,
+  no `failureType`, no items, `customerMessage` ending in "No Longer Available"),
+  or — on a download — has an item with no usable `sinf`/`dpInfo` material.
+- redownload → updateProduct when the request fails with an **empty HTTP 500**,
+  when redownload answers with the same availability message, or when a download
+  reply has no usable `sinf`/`dpInfo`. Only reached with a pinned version id,
+  since updateProduct needs one. ipatool gates this hop on the platform as well
+  (iOS/iPad/tvOS/watchOS/macOS, tvOS since `acd9e7a`); this project does not, so
+  visionOS is served the same fallback.
+- Redownload's exact 200-level no-licence pair (`Redownload Unavailable with This
+  Apple Account` plus its full explanation, at the top level or under `dialog`)
+  is remembered as a licence refusal while updateProduct is tried. If
+  updateProduct cannot serve it, the reply becomes `FAILURE_LICENSE_NOT_FOUND`, so
+  automatic licence acquisition can run. Near matches do not trigger a purchase.
 - A reply carrying a `failureType` is a real answer and is never retried on
   another host. `5002` is grouped with the password-token failures (`2034`,
   `2042`, `1008`) and reported as a session problem; `9610` means the license is
@@ -238,7 +264,9 @@ this project's addition):
 The same exchange backs every download-flow request — `getDownloadInfo`,
 `listVersions` (the version picker) and `getVersionMetadata` all call
 `requestDownloadProduct` — so this one fallback covers downloads, version
-listing and version metadata alike.
+listing and version metadata alike. Only the download path sets
+`requireDownloadMaterial`: version listing and metadata need the item metadata,
+not decryption material.
 
 The licence grant (`purchaseApp`) is the flow's one request with nowhere else to
 go, so it is repeated once through `repeatUnreachable` (`apple/retry.ts`) instead:
@@ -275,13 +303,20 @@ build relabelled iOS. Keeping the lookup fatal is deliberate.
 `lookupLatestExternalVersionID` and `lookupLatestMacOSExternalVersionID`. Three
 transports, one per platform family:
 
-- **iOS / iPad / tvOS** — the MDM catalogue at `uclient-api.itunes.apple.com`
-  with `p=mdm-lockup` and a per-platform `platform` parameter. iOS/iPad start
-  at the enterprise catalogue (`enterprisestore`) and fall back to the
-  consumer `iphone`/`ipad` catalogues — some storefronts have no enterprise
-  listing even when a consumer catalogue has the app (ipatool e5211d6). Each
-  lookup keeps the account's country code, and tvOS stays on the single `atv9`
-  catalogue.
+- **iOS / iPad / tvOS / watchOS** — the MDM catalogue at
+  `uclient-api.itunes.apple.com` with `p=mdm-lockup` and a per-platform
+  `platform` parameter. iOS/iPad/watchOS start at the enterprise catalogue
+  (`enterprisestore`) and fall back to the consumer `iphone`/`ipad` catalogues —
+  some storefronts have no enterprise listing even when a consumer catalogue has
+  the app (ipatool e5211d6). Each lookup keeps the account's country code, and
+  tvOS stays on the single `atv9` catalogue. When every iOS/iPad MDM catalogue answers without an app or offer,
+  the public `apps.apple.com/api/apps/v1/catalog/{cc}/apps/{id}` API is the
+  final fallback (ipatool e3932ce). It validates the app id, `type: "apps"`,
+  device family, bundle id and non-zero external version id. Successful answers
+  are cached for 15 minutes, concurrent lookups of the same key share one
+  request, and different apps are serialized through one catalog slot; a 429
+  pauses the fallback for `Retry-After` (default one minute, capped at five),
+  and transport/5xx failures never turn into "app missing".
 - **visionOS** — Apple's MDM catalogue does not carry visionOS offers, so the
   storefront product page at `apps.apple.com/{cc}/app/id{id}?platform=vision`
   is used instead. The `<script id="serialized-server-data">` JSON is parsed
@@ -294,9 +329,10 @@ transports, one per platform family:
   the same way (`"mac"` in `appPlatforms`, `salableAdamId` and `bundleId`
   matching).
 
-`downloadProduct.ts` pins tvOS/visionOS/macOS before the volumeStore request;
-`versionFinder.ts` pins the same three before the version list exchange. iOS/iPad
-pass an empty pin and let the exchange resolve one on fallback.
+`downloadProduct.ts` pins tvOS/watchOS/visionOS/macOS before the preferred
+download request; `versionFinder.ts` pins the same four before the version list
+exchange. iOS/iPad resolve their pin before ent/download and let the legacy
+exchange resolve one on fallback.
 
 Both storefront transports follow the redirects Apple answers those pages
 with: the slug-less `/app/id{id}` path is 301'd to its canonical URL, and a
@@ -321,6 +357,16 @@ is what refuses a package Apple serves to the wrong platform. When no storefront
 answers, the failure reported is the account's own one — it is the answer about
 the app the caller asked about.
 
+### Legacy macOS Version Metadata
+
+Older Mac downloads may have no `dpInfo` but still advertise
+`preflightPackageURL`, a small readable XAR containing `Distribution` metadata
+for the selected build. `packageVersionMetadata.ts` detects XAR by its header,
+reads only the TOC and Distribution ranges, verifies the extracted checksum, and
+uses the legacy installer version (`major.minor.patch.0.1.<unix-seconds>`) as the
+build date. The requested bundle id is checked against the Distribution product;
+the preflight URL is never treated as the app payload.
+
 ### macOS Packages Arrive Encrypted
 
 An App Store macOS download is not a `.pkg` yet: the bytes Apple serves are a
@@ -330,47 +376,53 @@ is in the download response's sinfs (`dpInfo`) plus the hardware id the download
 was requested with — the same value the request sent as `guid`, as raw bytes.
 
 Both travel from the client, which is the only side that ever talked to Apple:
-`apple/download.ts` keeps `dpInfo` (and refuses a macOS reply without it, or
-with two conflicting values), and `useDownloadAction` adds it to
-`POST /api/downloads` as `dpInfo` plus `hardwareId` — the account's
-`deviceIdentifier`, which is the hex form of those same bytes
-(`utils/account.ts#accountHardwareId`). `createTask` refuses a macOS task
-without them: without that, tens or hundreds of megabytes would be fetched for
-a package nothing could open. Neither is ever persisted or returned to a client
-(`sanitizeTaskForResponse`, and they are cleared together with the other
-per-attempt material on completion).
+`apple/download.ts` keeps `dpInfo` and rejects a macOS download reply without it
+unless the caller is the version-metadata path, which opts into a legacy
+preflight package via `allowMissingDPInfo`; `useDownloadAction` adds `dpInfo`
+plus `hardwareId` — the account's `deviceIdentifier`, which is the hex form of
+those same bytes (`utils/account.ts#accountHardwareId`) — to
+`POST /api/downloads`. `createTask` refuses a macOS task without them: without
+that, tens or hundreds of megabytes would be fetched for a package nothing could
+open. Neither is ever persisted or returned to a client (`sanitizeTaskForResponse`,
+and they are cleared together with the other per-attempt material on completion).
 
-`tools/macdecrypt/` is that decrypter: it loads the SAP assets plus the
-`storeagent` image Apple ships inside the same update package, opens a StoreAgent
-session and decrypts the file in place, 32 KiB at a time. It is its own Go
-module, and its module path deliberately sits under `github.com/majd/ipatool/v2/`
-so it may import the ipatool (MIT) internal packages where the emulation lives —
-Go's internal check compares the importing package's path. The dependency comes
-from the module proxy at the version pinned in `tools/macdecrypt/go.mod`
-(v2.6.0); the Dockerfile has
-the stage. That stage builds *natively* per target platform (no
-`--platform=$BUILDPLATFORM`): purego forces a dynamically linked ELF even with
-CGO off, so the interpreter recorded in the binary is the builder's own — an
-Alpine builder records the musl loader the Alpine runtime has, while a cross
-build records a glibc one no Alpine container ships, and `exec` of the helper
-then fails with ENOENT despite the file existing (the arm64 variant published
-by the QEMU cross build did exactly that on Apple-Silicon hosts). The stage
-runs the built helper before exporting it, so that failure cannot return.
-On an amd64 dev machine the arm64 variant still cannot decrypt end to end:
-its StoreAgent emulation runs nested under QEMU, and ipatool's hardcoded
-per-call 60 s emulation cap (`sapGuestTimeout`) then times out — that failure
-is the test environment, not the architecture, and it clears on real Apple
-Silicon hardware, where OrbStack runs the helper natively.
+`tools/macdecrypt/` is that decrypter. It is pinned at ipatool's macOS 27
+stack (the go.mod pseudo-version of `5dc4c80`): the guest is the arm64e
+`AppleMediaServices`, `commerce`, `CoreFP` and `CoreFP.icxs` images the helper
+resolves itself from Apple's public macOS 27.0.1 (26A434) restore image, and
+`commerce` carries the StoreAgent entry points — the 10.9-era update package
+and its separate `storeagent` image are gone from this stack (the browser's
+SAP signer and kbsync path still run the 10.9 x86_64 assets; that pipeline is
+unchanged). The machine runs on Unicorn's
+arm64 backend (2.1.4, CPU model max, with a compatibility layer for the
+atomics that build does not implement) rather than the x86_64 TCI emulation.
+The helper opens a StoreAgent session and decrypts the file in place, 32 KiB
+at a time. It is its own Go module, and its module path deliberately sits
+under `github.com/majd/ipatool/v2/` so it may import the ipatool (MIT)
+internal packages where the emulation lives — Go's internal check compares the
+importing package's path. The dependency comes from the module proxy at the
+version pinned in `tools/macdecrypt/go.mod`; the Dockerfile has the stage.
+That stage builds *natively* per target platform (no `--platform=$BUILDPLATFORM`):
+purego forces a dynamically linked ELF even with CGO off, so the interpreter
+recorded in the binary is the builder's own — an Alpine builder records the
+musl loader the Alpine runtime has, while a cross build records a glibc one no
+Alpine container ships, and `exec` of the helper then fails with ENOENT despite
+the file existing (the arm64 variant published by the QEMU cross build did
+exactly that on Apple-Silicon hosts). The stage runs the built helper before
+exporting it, so that failure cannot return. The guest architecture is not the
+host's: an amd64 container emulates arm64 on a native Unicorn (x86_64 JIT),
+but a nested QEMU dev machine runs the emulation under emulation, and ipatool's
+hardcoded per-call 60 s cap (`sapGuestTimeout`) then times out — that failure
+is the test environment, not the architecture, and it clears where the helper
+runs natively (Apple Silicon, or amd64 on bare x86_64).
 For a development instance, `bash tools/macdecrypt/build.sh` — or
 `tools/macdecrypt/build.ps1` on Windows without bash (PowerShell, no bash
 needed) — builds into `tools/macdecrypt/macdecrypt(.exe)`, where the backend
 finds it by convention; there is no `MACDECRYPT_PATH` — the helper is looked
 for at `/opt/asspp/macdecrypt` (the image) then that repo path, and a macOS
-task fails naming both when neither exists. Measured throughput is ~2 MB/s, so a
-70 MB package takes about 35 s — which is why this runs on the server rather
-than in the browser's TCI-interpreted engine (the browser would need minutes per
-download). Its first run downloads Apple's assets and the Unicorn runtime it
-emulates with, cached under `<DATA_DIR>/cache` so a replacement container does
+task fails naming both when neither exists. Its first run resolves the macOS 27
+assets (range-reads of the restore image's AEA cryptexes, 125 MB cached) and
+the Unicorn runtime, under `<DATA_DIR>/cache`, so a replacement container does
 not pay again (`services/macDecrypt.ts` sets `XDG_CACHE_HOME` for the child).
 
 `services/macDecrypt.ts` runs it and replaces the ciphertext with the package it
@@ -405,18 +457,26 @@ After: `backend/src/services/packagePlatform.ts` mirrors ipatool's
 `CFBundleSupportedPlatforms` is **the authority** over the platform the request
 named: a universal app searched as tvOS may have served its iOS build, and the
 package knows which. `platformFromSupported` reads the platform out of it
-(`XROS` → visionOS, `AppleTVOS` → tvOS, `iPhoneOS` → iOS) and the completion path
+(`XROS` → visionOS, `AppleTVOS` → tvOS, `WatchOS` → watchOS, `iPhoneOS` → iOS)
+and the completion path
 **rewrites the task's platform** to what the package really is
 (`downloadManager`, right after the download) rather than failing — the task
-then reads as the platform it actually holds. Only a package declaring no known
-platform at all fails the task. macOS packages skip the check (they are not
-IPAs, and `isMacOSPackage` is decided by the task's platform).
+then reads as the platform it actually holds. Legacy iOS/iPad packages may omit
+`CFBundleSupportedPlatforms` entirely; that missing field is accepted only for
+an iOS/iPad task, while an empty, malformed or conflicting declaration still
+fails. macOS packages skip the check (they are not IPAs, and `isMacOSPackage` is
+decided by the task's platform).
 
-The payload both endpoints receive is `creditDisplay`, `guid`, `salableAdamId`
-(integer), `serialNumber: "0"`, plus the endpoint's version key when pinned. The
-original POST is replayed at any redirect location (the volumeStore pod
+The legacy volumeStore/redownload/updateProduct payload is `creditDisplay`,
+`guid`, `salableAdamId` (integer), `serialNumber: "0"`, plus the endpoint's
+version key when pinned. ent/download instead sends a plist with string
+`salableAdamId`, a nine-byte `serialNumber` derived from the device GUID, plus
+`kbsync`, `externalVersionId`, and the GUID. Store's XMLPayload sends those plist
+bytes with the form-urlencoded content type (as ipatool does). The original POST
+is replayed at any redirect location in the legacy chain (the volumeStore pod
 hand-off expects the same body; Go's client would downgrade 302 to a bodyless
-GET).
+GET). ent/download deliberately does not follow redirects because its `X-Token`
+must only reach the exact Apple origin.
 
 ### Version flows share the exchange
 
@@ -454,6 +514,18 @@ HTTP 500 carrying no `failureType` as success: all three mean the order is
 already fulfilled, and ipatool's CLI ignores its `ErrLicenseAlreadyExists` as a
 terminal success state. `2059` retries once with the Apple Arcade
 `pricingParameters` (`GAME`), matching ipatool.
+
+### Expired sessions are renewed before the exchange is retried
+
+Imported accounts carry the password token and cookies they had at export time,
+so a download can answer `2034`, `2042`, `1008`, or `5002`, and a version list
+can answer `2034` or `2042`, before any license step runs. `useDownloadAction`
+renews that session through `authenticate(account.email, account.password, …)`
+and repeats the same request once with the new token and cookies. A second
+session failure is Apple's answer to the renewed session and surfaces unchanged;
+the renewal is not a general retry loop. The renewed account remains the current
+one even when that second request fails for another reason, so a following
+license step never falls back to the session that just expired.
 
 ### Finding apps (link, bundle id, or App ID)
 
@@ -500,6 +572,18 @@ package index is another build's download by nature — and in both the compiled
 package supplies the truth instead (the date read from the archive, the size
 measured after injection).
 
+Apple's `md5` from the download item travels with the task and is checked against
+the raw bytes after transfer but before macOS decryption or IPA injection. A
+mismatch deletes the file and `.part` chunks and retries the full download once;
+a second mismatch fails the task and removes the bad file. The field reaches the
+client either as a 32-character hex string or as the `<data>` bytes of the digest
+itself, and both forms are normalised to hex — accepting only the string would
+skip the check silently on the other. The retry runs on the attempt's own
+controller and verifies it still owns the registration before starting: the hash
+is an await point, so a pause landing inside it unwinds as a stale attempt
+instead of downloading a second transfer over a row another attempt owns. This
+is a transfer integrity check, not an authenticity proof.
+
 Until step 3 lands, the on-disk layout uses the app id as the directory segment
 (`appPathSegment`), which is also ipatool's rule of omitting the fields it does
 not know. `POST /api/downloads` rejects a request without a positive app id, and
@@ -542,8 +626,12 @@ name); the guess can only ever rule ids *out*, since
 an id the iOS list carries, an id another platform's own source or recorded pin
 names, and an id the package index holds under another platform
 (`GET /api/package-builds/:appId`) are never candidates) keeps the card closed
-and says why. A pin that cannot be resolved *at all* — no catalogue offer, no
-recorded pin, and nothing left to guess
+and says why. A version whose cached `supportedPlatforms` — `GET
+/api/version-metadata/:appId/platforms` carries only entries this instance
+compiled (`source === package`), so a client- or URL-supplied declaration can
+never clear one — names the target is not ruled out by another platform's index
+entry: a universal build can serve both, but only a package the server attests. A pin that cannot be resolved *at all* — no catalogue offer, no recorded
+pin, and nothing left to guess
 (`apple/errors.ts` → `PlatformVersionUnavailableError`) — is an answer rather
 than an inconclusive failure: the app is untouched, but this platform has
 nothing to fetch, so the card stays closed saying which platform has no version
@@ -749,11 +837,11 @@ The backend proxies the bag endpoint via `GET /api/bag?guid=<deviceId>` using No
 
 ### Version Metadata Cache
 
-`services/versionMetadataCache.ts` + `routes/versionMetadata.ts` serve a read-only, instance-wide `(appId, versionId) -> (displayVersion, releaseDate)` directory via `GET /api/version-metadata/:appId`. Entries come from **two sources**: the download pipeline passively seeds what compiled packages read back (the two `applyPackageMetadata` sites in downloadManager, including the startup `repairFinishedPackages` pass), and clients may save metadata they fetched live from Apple via `PUT /api/version-metadata/:appId/:versionId`, or hand over a package download URL via `POST /api/version-metadata/:appId/:versionId/package` for the server to read directly. Reads and the pipeline itself never contact Apple (the server holds no credentials); the one exception is that `POST …/package` fetches the client-supplied download URL — an IPA's public bytes only, validated to `*.apple.com` and with redirects refused — to read the build's metadata. Package-sourced entries are immutable and always win over client-saved ones — the IPA is the authority; a client write that would displace a package entry is declined with `saved: false`. The data is storefront-public and carries no account binding, but reads still ride `accessAuth`. Entries are immutable (a version id names a fixed build), capped at `VERSION_METADATA_MAX_ENTRIES` (oldest evicted first), and stored in the `version_metadata` table of the backend SQLite DB (`backed by db.ts`). The frontend consumes the cache best-effort (`api/versionMetadata.ts`, `hooks/useVersionMetadata.ts`, `utils/versionLabels.ts`) and falls back to the live Apple exchange for uncached versions. The hook marks versions whose lookup is in flight as `pending` (`store/versionMetadata.ts`), so the pickers and rows can show a fetching marker (`search.versions.fetching`) instead of a bare id while it runs. A list load fills up to a hundred missing versions — the first twenty five wide, the rest one at a time — and leaving the page cancels the queue; results already fetched keep their write-back (keepalive requests, so a closing tab still delivers them). With the automation switch off, the version picker offers the same fill on demand: a 「查版本号」 button left of 「下载」, styled like 「选择版本」 (`search.product.checkVersionNumbers`; it passes `force` to run the fill even though the automatic path is off).
+`services/versionMetadataCache.ts` + `routes/versionMetadata.ts` serve a read-only, instance-wide `(appId, versionId) -> (displayVersion, releaseDate, minimumOsVersion, supportedPlatforms)` directory via `GET /api/version-metadata/:appId`. The last two are package facts: an IPA contributes `MinimumOSVersion` and `CFBundleSupportedPlatforms` from the same `Info.plist` read that dates it; a legacy Mac preflight XAR contributes `<os-version min="…">` and `["macOS"]`. They are optional (an older package may declare neither), and the detail view uses the selected build’s `minimumOsVersion` before falling back to the app record. `minimumOsVersion` is stored as `""` when a package was read and declares no floor, and as SQL NULL when the row predates the field (or a client wrote it without reading a package): the frontend backfill keys on that distinction, so a cached row from an older build — which has a package date but no floor — is re-read once, while a finished read is never re-asked. `GET /api/version-metadata/:appId/platforms` exposes just the cached version-id → declaration map for the pin guess, which uses it to keep a universal build from being treated as another platform’s foreign id. Entries come from **two sources**: the download pipeline passively seeds what compiled packages read back (the two `applyPackageMetadata` sites in downloadManager, including the startup `repairFinishedPackages` pass), and clients may save metadata they fetched live from Apple via `PUT /api/version-metadata/:appId/:versionId`, or hand over a package download URL via `POST /api/version-metadata/:appId/:versionId/package` for the server to read directly. Reads and the pipeline itself never contact Apple (the server holds no credentials); the one exception is that `POST …/package` fetches the client-supplied download URL — an IPA's public bytes only, validated to `*.apple.com` and with redirects refused — to read the build's metadata. Package-sourced entries are immutable and always win over client-saved ones — the IPA is the authority; a client write that would displace a package entry is declined with `saved: false`. The data is storefront-public and carries no account binding, but reads still ride `accessAuth`. Entries are immutable (a version id names a fixed build), capped at `VERSION_METADATA_MAX_ENTRIES` (oldest evicted first), and stored in the `version_metadata` table of the backend SQLite DB (`backed by db.ts`). The frontend consumes the cache best-effort (`api/versionMetadata.ts`, `hooks/useVersionMetadata.ts`, `utils/versionLabels.ts`) and falls back to the live Apple exchange for uncached versions. The hook marks versions whose lookup is in flight as `pending` (`store/versionMetadata.ts`), so the pickers and rows can show a fetching marker (`search.versions.fetching`) instead of a bare id while it runs. A list load fills up to a hundred missing versions — the first twenty five wide, the rest one at a time — and leaving the page cancels the queue; results already fetched keep their write-back (keepalive requests, so a closing tab still delivers them). With the automation switch off, the version picker offers the same fill on demand: a 「查版本号」 button left of 「下载」, styled like 「选择版本」 (`search.product.checkVersionNumbers`; it passes `force` to run the fill even though the automatic path is off).
 
 ### Version Pin Store
 
-`services/versionPinStore.ts` + `routes/versionPins.ts` serve a read-only, instance-wide `(appId, platform) -> externalVersionId` record via `GET /api/version-pins/:appId`. It exists because listing versions for tvOS / visionOS / macOS requires pinning the download-product exchange to a version id that exists for that platform — and the catalogue lookup that normally supplies it has no answer left for **delisted apps**. A past download of the app left the id behind in its finished package, so recording it keeps those apps queryable. Seeded **passively only** (the completion and `repairFinishedPackages` paths of the download pipeline; no client write-back, no server-side Apple queries), the newest (largest) id per app+platform wins, and the store writes to the `version_pins` table of the backend SQLite DB (`backed by db.ts`). The frontend consumes it best-effort in `apple/versionPins.ts` (`recordedVersionIdFor` / `withRecordedFallback`): the live catalogue lookup stays first; the recorded pin is the fallback for both version listing (`apple/versionFinder.ts`, which also accepts a caller-provided pin) and the download flow's pin resolution (`apple/downloadProduct.ts`). The search page passes a hand-entered version id as the exchange pin
+`services/versionPinStore.ts` + `routes/versionPins.ts` serve a read-only, instance-wide `(appId, platform) -> externalVersionId` record via `GET /api/version-pins/:appId`. It exists because listing versions for tvOS / watchOS / visionOS / macOS requires pinning the download-product exchange to a version id that exists for that platform — and the catalogue lookup that normally supplies it has no answer left for **delisted apps**. A past download of the app left the id behind in its finished package, so recording it keeps those apps queryable. Seeded **passively only** (the completion and `repairFinishedPackages` paths of the download pipeline; no client write-back, no server-side Apple queries), the newest (largest) id per app+platform wins, and the store writes to the `version_pins` table of the backend SQLite DB (`backed by db.ts`). The frontend consumes it best-effort in `apple/versionPins.ts` (`recordedVersionIdFor` / `withRecordedFallback`): the live catalogue lookup stays first; the recorded pin is the fallback for both version listing (`apple/versionFinder.ts`, which also accepts a caller-provided pin) and the download flow's pin resolution (`apple/downloadProduct.ts`). The search page passes a hand-entered version id as the exchange pin
 directly.
 
 `services/packageAppStore.ts` is the companion index for delisted apps
@@ -766,7 +854,9 @@ platforms (`Forward` was 1.3.18 on iOS and 1.3.19 on tvOS) — and each build
 carries Apple's external version id, its version, minimum OS, release date and
 on-disk package size (the download pipeline measures the size after injection
 and reads the id from the store metadata, which is the only source a delisted
-app has for either). `routes/packageBuilds.ts` exposes the index read-only as
+app has for either). The *version-level* platform declaration lives in the
+version metadata cache instead, because the package index keeps only one build
+per platform. `routes/packageBuilds.ts` exposes the index read-only as
 `GET /api/package-builds/:appId` — every build per platform, with the id and
 version each package carried. It answers what the pin store cannot: a pin keeps
 one id per platform (the newest this instance downloaded), while a caller that
@@ -790,7 +880,8 @@ where a seller would go.
 - `appleRequest()` in `frontend/src/apple/request.ts` wraps `libcurl.fetch` for all Apple API calls and forces HTTP/1.1 (`_libcurl_http_version: 1.1`)
 - Bag endpoint (`frontend/src/apple/bag.ts`) uses backend proxy (`/api/bag`) and falls back to `https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate` when `authenticateAccount` is missing or bag fetch fails
 - Authentication (`frontend/src/apple/authenticate.ts`) resolves bag endpoint, then sets `guid` via URL query manipulation to avoid duplicate/malformed query parameters
-- Phone-number Apple IDs (China mainland, India — no `@` in the identifier) name no storefront, and Apple sends their verification code only to a request that asks as their region's store, so the auth request carries `X-Apple-Store-Front` from `authStoreFront()` (`apple/config.ts`, mirroring ipatool). Emails get no header
+- Phone-number Apple IDs (China mainland, India — no `@` in the identifier) name no storefront, and Apple sends their verification code only to a request that asks as their region's store, so the auth request carries `X-Apple-Store-Front` from `authStoreFront()` (`apple/config.ts`, mirroring ipatool). Only ASCII spaces/hyphens are removed; every remaining character must be an ASCII digit, so a legacy username cannot be mistaken for a phone number. Emails get no header
+- 2FA input is normalized once at the `authenticate()` boundary: whitespace is removed, exactly six ASCII digits are required, and the password itself is never trimmed or rewritten. The account forms also sanitize pasted input before state is stored and keep the verify button disabled until six digits are present. Invalid input fails before bag lookup or SAP preparation
 - `authenticate()` takes the sign-in identifier (`appleId`), which is what the persisted `Account.email` field holds — that name is load-bearing (it is the IndexedDB object store's `keyPath`, keys `/accounts/:email` and the import dedupe, and travels in the export format), so a phone-number account keeps its number there rather than in another field. The add-account form trims it before signing in, because a pasted phone number carries its own separators and this value is the account's key
 - An empty `failureType` with `customerMessage === 'MZFinance.BadLogin.Configurator_message'` means two different things: Apple wants a code (`errors.auth.requiresVerification`, `codeRequired` set), or Apple refused the one it was sent (`errors.auth.verificationIncomplete`). Only the caller's own input tells them apart, so the raw Apple token never reaches the toast
 - Plist build/parse (`frontend/src/apple/plist.ts`) uses native XML builder and browser-native `DOMParser`
@@ -898,7 +989,7 @@ There is no E2E suite or lint script in the repo currently. Real-account Docker 
 SAP-specific tests:
 
 - `frontend/tests/sap/machImage.test.ts` (vitest) — synthetic Mach-O builder exercising symbol export, rebase/bind opcodes, addends, and BSS-tail fixup tolerance
-- `frontend/tests/sap/machine-live.mjs` (manual, `npx tsx`) — full chain against the real Apple assets served by the backend: machine open → Initialize (context matches the native ipatool runtime bit-for-bit: `0x400000000200`) → Sign correctly gated by the key exchange (`-42085` without it, identical to native). Requires `SAP_ASSET_DIR` pointing at a flat copy of the four assets, or the nested extraction layout
+- `frontend/tests/sap/machine-live.mjs` (manual, `npx tsx`) — two isolated smoke runs against the real Apple assets: the default run opens the signer profile → Initialize (context matches native ipatool: `0x400000000200`) → Sign gated by the key exchange (`-42085`); `SAP_SMOKE=kbsync` opens a StoreAgent-only profile and generates a 196-byte kbsync blob. Run them as separate processes because the vendored Emscripten module keeps process-global C state. Requires `SAP_ASSET_DIR` pointing at a flat copy of the five assets (including `StoreAgent`), or the nested extraction layout
 
 Test credentials, if ever needed, belong in environment variables (`TEST_EMAIL`, `TEST_PASSWORD`, `TEST_DEVICE_ID`, `TEST_BUNDLE_ID`) and must never be committed.
 

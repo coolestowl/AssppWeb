@@ -151,13 +151,20 @@ describe("useVersionMetadataMap", () => {
     });
     useVersionMetadataStore.setState({
       entries: {
-        // Package-sourced: the row already carries the build's own date.
-        known: { displayVersion: "0.1.0", releaseDate: "x", source: "package" },
+        // Package-sourced: the row already carries the build's own date and
+        // was already checked for a floor ("" = the package declares none).
+        known: {
+          displayVersion: "0.1.0",
+          releaseDate: "x",
+          minimumOsVersion: "",
+          source: "package",
+        },
         // And the same, from a package read at a client's URL — what a fill
         // leaves behind. It carries a build's date, so it is just as done.
         filled: {
           displayVersion: "0.2.0",
           releaseDate: "y",
+          minimumOsVersion: "16.0",
           source: "package-read",
         },
       },
@@ -370,6 +377,8 @@ describe("useVersionMetadataMap", () => {
     vi.mocked(fetchPackageVersionMetadata).mockResolvedValue({
       displayVersion: "2.2.2",
       releaseDate: "2026-05-05T00:00:00Z",
+      minimumOsVersion: "16.4",
+      supportedPlatforms: ["iPhoneOS"],
       source: "package-read",
     });
 
@@ -380,12 +389,17 @@ describe("useVersionMetadataMap", () => {
 
     await vi.waitFor(() => {
       expect(result.current.versionMeta["101"]?.displayVersion).toBe("2.2.2");
+      expect(result.current.versionMeta["101"]?.minimumOsVersion).toBe("16.4");
+      expect(result.current.versionMeta["101"]?.supportedPlatforms).toEqual([
+        "iPhoneOS",
+      ]);
     });
     // The backend reads the date out of the package the pinned exchange named.
     expect(fetchPackageVersionMetadata).toHaveBeenCalledWith(
       app.id,
       "102",
       "https://iosapps.example.com/app.ipa",
+      "com.example.utility",
     );
     await vi.waitFor(() => {
       expect(mocks.updateAccount).toHaveBeenCalledTimes(2);
@@ -394,6 +408,74 @@ describe("useVersionMetadataMap", () => {
       ...account,
       cookies: [],
     });
+  });
+
+  it("reads a legacy Mac build from its preflight package", async () => {
+    const macApp = { ...app, platform: "macos" as const };
+    vi.mocked(getDownloadInfo).mockResolvedValue({
+      output: {
+        downloadURL: "https://iosapps.example.com/encrypted.pkg",
+        preflightPackageURL: "https://iosapps.example.com/preflight.pkg",
+        sinfs: [],
+        bundleShortVersionString: "4.3",
+        bundleVersion: "4.3",
+        bundleID: "com.example.utility",
+      },
+      updatedCookies: [],
+    });
+    vi.mocked(fetchPackageVersionMetadata).mockResolvedValue({
+      displayVersion: "4.2",
+      releaseDate: "2012-07-06T09:54:33.000Z",
+      source: "package-read",
+    });
+
+    const { result } = renderHook(() => useVersionMetadataMap());
+    await act(async () => {
+      await result.current.prefetchMissing(account, macApp, ["12013122"]);
+    });
+
+    expect(fetchPackageVersionMetadata).toHaveBeenCalledWith(
+      macApp.id,
+      "12013122",
+      "https://iosapps.example.com/preflight.pkg",
+      "com.example.utility",
+    );
+    expect(result.current.versionMeta["12013122"].releaseDate).toBe(
+      "2012-07-06T09:54:33.000Z",
+    );
+  });
+
+  it("uses the actual Mac package when dpInfo is present", async () => {
+    const macApp = { ...app, platform: "macos" as const };
+    vi.mocked(getDownloadInfo).mockResolvedValue({
+      output: {
+        downloadURL: "https://iosapps.example.com/encrypted.pkg",
+        preflightPackageURL: "https://iosapps.example.com/preflight.pkg",
+        sinfs: [],
+        bundleShortVersionString: "4.3",
+        bundleVersion: "4.3",
+        bundleID: "com.example.utility",
+        dpInfo: "QUJDRA==",
+      },
+      updatedCookies: [],
+    });
+    vi.mocked(fetchPackageVersionMetadata).mockResolvedValue({
+      displayVersion: "4.3",
+      releaseDate: "2026-01-01T00:00:00.000Z",
+      source: "package-read",
+    });
+
+    const { result } = renderHook(() => useVersionMetadataMap());
+    await act(async () => {
+      await result.current.prefetchMissing(account, macApp, ["12013123"]);
+    });
+
+    expect(fetchPackageVersionMetadata).toHaveBeenCalledWith(
+      macApp.id,
+      "12013123",
+      "https://iosapps.example.com/encrypted.pkg",
+      "com.example.utility",
+    );
   });
 
   it("prefetches with the freshest stored copy of the account", async () => {
@@ -577,12 +659,76 @@ describe("useVersionMetadataMap", () => {
     expect(getDownloadInfo).toHaveBeenCalledTimes(2);
   });
 
+  it("backfills the minimum OS of a row cached before the field existed", async () => {
+    // What the pre-upgrade cache left behind: a package-vouched date, but no
+    // minimumOsVersion key at all — the old shape.
+    useVersionMetadataStore.setState({
+      entries: {
+        "893000072": {
+          displayVersion: "8.5.7",
+          releaseDate: "2026-10-12T12:13:38.000Z",
+          source: "package-read",
+        },
+      },
+    });
+    vi.mocked(getDownloadInfo).mockResolvedValue({
+      output: {
+        downloadURL: "https://iosapps.example.com/app.ipa",
+        sinfs: [],
+        bundleShortVersionString: "8.5.7",
+        bundleVersion: "857",
+        bundleID: "com.firecore.infuse",
+      },
+      updatedCookies: [],
+    });
+    vi.mocked(fetchPackageVersionMetadata).mockResolvedValue({
+      displayVersion: "8.5.7",
+      releaseDate: "2026-10-12T12:13:38.000Z",
+      minimumOsVersion: "15.0",
+      supportedPlatforms: ["iPhoneOS"],
+      source: "package-read",
+    });
+
+    const { result } = renderHook(() => useVersionMetadataMap());
+    await act(async () => {
+      await result.current.prefetchMissing(account, app, ["893000072"]);
+    });
+
+    expect(getDownloadInfo).toHaveBeenCalledTimes(1);
+    expect(result.current.versionMeta["893000072"]?.minimumOsVersion).toBe(
+      "15.0",
+    );
+  });
+
+  it("does not re-read a row already checked with no declared floor", async () => {
+    // "" is a finished answer: the package was read and names no floor.
+    useVersionMetadataStore.setState({
+      entries: {
+        "893000073": {
+          displayVersion: "8.5.8",
+          releaseDate: "2026-10-15T04:29:24.000Z",
+          minimumOsVersion: "",
+          source: "package-read",
+        },
+      },
+    });
+
+    const { result } = renderHook(() => useVersionMetadataMap());
+    await act(async () => {
+      await result.current.prefetchMissing(account, app, ["893000073"]);
+    });
+
+    expect(getDownloadInfo).not.toHaveBeenCalled();
+    expect(getVersionMetadata).not.toHaveBeenCalled();
+  });
+
   it("does not retry a version whose date came from its package", async () => {
     useVersionMetadataStore.setState({
       entries: {
         "700": {
           displayVersion: "1.0.0",
           releaseDate: "2026-01-01T00:00:00Z",
+          minimumOsVersion: "16.0",
           source: "package",
         },
       },

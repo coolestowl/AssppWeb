@@ -1,3 +1,4 @@
+import type { DownloadStageObserver } from "./sap/client";
 import type { Account, Software } from "../types";
 import {
   FAILURE_LICENSE_NOT_FOUND,
@@ -51,16 +52,17 @@ export async function listVersions(
   account: Account,
   app: Software,
   pinnedVersionId?: string,
+  onStage?: DownloadStageObserver,
 ): Promise<VersionListOutput & { updatedCookies: typeof account.cookies }> {
   const session = createDownloadSession(account, app);
 
-  // ipatool's ListVersions pins macOS/tvOS/visionOS before the exchange so the
-  // version list reflects the requested platform, not the default device class
-  // (iOS). iOS/iPad pass an empty pin and let the exchange resolve one on fallback.
+  // ipatool's ListVersions pins macOS/tvOS/watchOS/visionOS before the exchange
+  // so the version list reflects the requested platform, not the default device
+  // class (iOS). iOS/iPad pass an empty pin and let the exchange resolve one on fallback.
   const requestedPin = pinnedVersionId?.trim();
   const pin = requestedPin ? requestedPin : await platformVersionPin(session);
 
-  const reply = await requestDownloadProduct(session, pin);
+  const reply = await requestDownloadProduct(session, pin, { onStage });
 
   assertListVersionsReply(reply);
 
@@ -79,8 +81,8 @@ export async function listVersions(
 /**
 
  * Resolves the platform-specific version pin for the version list exchange
- * (ipatool's `ListVersions`): macOS/tvOS/visionOS pin before the exchange so the
- * listed versions belong to the requested platform; iOS/iPad pass an empty pin.
+ * (ipatool's `ListVersions`): macOS/tvOS/watchOS/visionOS pin before the exchange
+ * so the listed versions belong to the requested platform; iOS/iPad pass an empty pin.
  * When the catalogue cannot name a version — the delisted-app case this exists
  * for — the pin recorded from a previous download is used instead.
  */
@@ -107,6 +109,7 @@ async function platformVersionPin(
             country,
             platform,
             session.cookies,
+            session.app.bundleID || undefined,
           ),
     session.app.id,
     platform,

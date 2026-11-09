@@ -303,7 +303,23 @@ describe('ProductDetail download action', () => {
 
   it('keeps the download button stable until startDownload resolves', async () => {
     const deferred = deferredPromise();
-    mocks.startDownload.mockReturnValue(deferred.promise);
+    mocks.startDownload.mockImplementation(
+      async (
+        _account: Account,
+        _app: Software,
+        _versionId: string | undefined,
+        _country: string | undefined,
+        onStage?: (
+          progress: {
+            stage: "preparing" | "initializing" | "connecting" | "confirming";
+            percent: number | null;
+          } | null,
+        ) => void,
+      ) => {
+        onStage?.({ stage: "preparing", percent: 42 });
+        await deferred.promise;
+      },
+    );
     const user = userEvent.setup();
 
     const { rerender } = renderProductDetail();
@@ -333,6 +349,7 @@ describe('ProductDetail download action', () => {
       app,
       undefined,
       'US',
+      expect.any(Function),
     );
     expect(downloadButton).toBeDisabled();
     expect(downloadButton).toHaveAttribute('aria-busy', 'true');
@@ -342,6 +359,15 @@ describe('ProductDetail download action', () => {
     expect(downloadButton).toHaveClass('w-full', 'min-w-0');
     expect(downloadButton).not.toHaveClass('opacity-50');
     expect(downloadButton.querySelector('.animate-spin')).toBeInTheDocument();
+    const progressLine = screen.getByRole('status');
+    expect(progressLine).toHaveTextContent(
+      'downloads.progress.preparing',
+    );
+    expect(screen.getByRole('progressbar')).toHaveAttribute(
+      'aria-valuenow',
+      '42',
+    );
+    expect(document.querySelectorAll('.animate-spin')).toHaveLength(1);
     // The icon slot holds the spinner while the download runs — and it stays
     // in the layout on phones now that the buttons sit on a two-column grid.
     expect(iconSlot).toHaveClass('flex');
@@ -385,6 +411,7 @@ describe('ProductDetail download action', () => {
     expect(downloadButton).toHaveClass('w-full', 'min-w-0');
     expect(downloadButton).not.toHaveClass('opacity-50');
     expect(downloadButton.querySelector('.animate-spin')).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
     expect(downloadButton.querySelector('span[aria-hidden="true"]')).toBe(
       iconSlot,
     );
@@ -450,9 +477,9 @@ describe('ProductDetail download action', () => {
 
     expect(actionRow).toBe(downloadButton.parentElement);
     expect(actionRow).toBe(selectVersionButton.parentElement);
-    // Two columns on phones so icon and label fit; four from sm up, the same
-    // slots whichever actions happen to be showing.
-    expect(actionRow).toHaveClass('grid', 'grid-cols-2', 'sm:grid-cols-4');
+    // Two columns while the sidebar leaves too little room (phones and tablets);
+    // four only once the content area is wide enough for every label.
+    expect(actionRow).toHaveClass('grid', 'grid-cols-2', 'lg:grid-cols-4');
     expect(Array.from(actionRow?.children ?? [])).toEqual([
       licenseButton,
       downloadButton,
@@ -616,11 +643,15 @@ describe('ProductDetail download action', () => {
       '890964826': {
         displayVersion: '8.2.1',
         releaseDate: '2026-05-01T00:00:00Z',
+        // Already checked: "" means the package declares no floor, so the
+        // backfill does not ask Apple again for either row.
+        minimumOsVersion: '',
         source: 'package',
       },
       '890657720': {
         displayVersion: '8.2.0',
         releaseDate: '2026-04-01T00:00:00Z',
+        minimumOsVersion: '16.0',
         source: 'package',
       },
     });
@@ -664,7 +695,12 @@ describe('ProductDetail download action', () => {
       screen.getByRole('button', { name: 'search.product.selectVersion' }),
     );
     await waitFor(() => expect(mocks.listVersions).toHaveBeenCalledTimes(1));
-    expect(mocks.listVersions).toHaveBeenCalledWith(account, app, undefined);
+    expect(mocks.listVersions).toHaveBeenCalledWith(
+      account,
+      app,
+      undefined,
+      expect.any(Function),
+    );
 
     const combo = await screen.findByRole('combobox', {
       name: 'search.product.version',
@@ -688,6 +724,7 @@ describe('ProductDetail download action', () => {
       app,
       '890657720',
       'US',
+      expect.any(Function),
     );
   });
 
@@ -801,6 +838,7 @@ describe('ProductDetail download action', () => {
       app.id,
       '890964826',
       'https://iosapps.example.com/app.ipa',
+      app.bundleID,
     );
     // The exchange is not asked for a date the package already gave.
     expect(vi.mocked(getVersionMetadata)).not.toHaveBeenCalled();
@@ -940,6 +978,7 @@ describe('ProductDetail download action', () => {
       app,
       '818970197',
       'US',
+      expect.any(Function),
     );
   });
 
@@ -959,7 +998,12 @@ describe('ProductDetail download action', () => {
       screen.getByRole('button', { name: 'search.product.selectVersion' }),
     );
     await waitFor(() => expect(mocks.listVersions).toHaveBeenCalledTimes(1));
-    expect(mocks.listVersions).toHaveBeenCalledWith(account, app, '818970197');
+    expect(mocks.listVersions).toHaveBeenCalledWith(
+      account,
+      app,
+      '818970197',
+      expect.any(Function),
+    );
 
     const combo = await screen.findByRole('combobox', {
       name: 'search.product.version',
@@ -976,6 +1020,7 @@ describe('ProductDetail download action', () => {
       app,
       '818970197',
       'US',
+      expect.any(Function),
     );
   });
 
@@ -1089,6 +1134,7 @@ describe('ProductDetail download action', () => {
       { ...app, metadataSource: 'local' },
       '890657720',
       'US',
+      expect.any(Function),
     );
   });
 
@@ -1154,6 +1200,7 @@ describe('ProductDetail download action', () => {
       { ...app, metadataSource: 'local' },
       '818970197',
       'US',
+      expect.any(Function),
     );
   });
 
@@ -1230,6 +1277,8 @@ describe('ProductDetail download action', () => {
         versionId: '901',
         displayVersion: '3.4.5',
         releaseDate: '2026-09-01T00:00:00Z',
+        minimumOsVersion: '17.0',
+        supportedPlatforms: ['iPhoneOS'],
         source: 'package' as const,
       },
     };
@@ -1262,7 +1311,7 @@ describe('ProductDetail download action', () => {
       expect(detailsTable()['search.product.version']).toBe('3.4.5 (901)'),
     );
     expect(detailsTable()['search.product.size']).toBe('—');
-    expect(detailsTable()['search.product.minOs']).toBe('—');
+    expect(detailsTable()['search.product.minOs']).toBe('iOS 17.0');
     expect(detailsTable()['search.product.released']).toBe('2026-09-01');
 
     // Picking the recorded build brings the record's numbers back.
@@ -2244,6 +2293,7 @@ describe('ProductDetail download action', () => {
         regionAccount,
         expect.objectContaining({ id: 6503940939 }),
         '890964826',
+        { allowMissingDPInfo: true },
       ),
     );
     expect(vi.mocked(getDownloadInfo)).not.toHaveBeenCalledWith(

@@ -128,7 +128,7 @@
       "preparingAssets": "Preparing signing components {{percent}}%",
       "preparingSigner": "Initializing the request signer…",
       "signerFailed": "Failed to prepare signing components: {{error}}",
-      "signerFirstRun": "First run: preparing the signing component (~14 MB, this once).",
+      "signerFirstRun": "First run: preparing the signing component (~12 MB, this once).",
       "retrySignIn": "Retry Sign In"
     },
     "detail": {
@@ -154,6 +154,13 @@
     }
   },
   "downloads": {
+    "progress": {
+      "preparing": "Preparing download components…",
+      "preparingLabel": "Preparing download components",
+      "initializing": "Initializing download components…",
+      "connecting": "Connecting to the App Store…",
+      "confirming": "Confirming download information…"
+    },
     "title": "Downloads",
     "warning": "Packages are temporary and will be cleared on server restart. Download or install promptly.",
     "warningShort": "Temporary; cleared on restart—save promptly.",
@@ -161,11 +168,11 @@
     "emptyAll": "No downloads yet.",
     "emptyAllDesc": "Your download queue is empty. Head to the search page to explore and download the apps you need.",
     "emptyAllDescShort": "No downloads yet—find apps in Search.",
-    "emptyFilter": "No {{status}} downloads.",
-    "emptyFilterDesc": "No download records match this status.",
-      "filter": "Filter",
-      "statusWithCount": "{{status}} ({{count}})",
-      "filterActive": "In progress",
+    "emptyFilter": "No downloads for {{account}}.",
+    "emptyFilterDesc": "No download records match this account.",
+    "accountFilter": "Filter by account",
+    "accountWithCount": "{{account}} ({{count}})",
+    "allAccounts": "All accounts",
     "searchApps": "Search for apps to download",
     "deleteConfirm": "Delete this download?",
     "deletePrompt": "Delete {{appName}}? This cannot be undone — the package will be removed from the server.",
@@ -494,6 +501,7 @@
     "auth": {
       "requiresVerification": "Authentication requires verification code. If no verification code was prompted, try logging in at https://account.apple.com to trigger the alert and fill the code in the 2FA Code field.",
       "verificationIncomplete": "Apple did not complete the verification. Request a fresh code and enter it again.",
+      "invalidCode": "2FA code must contain exactly six digits.",
       "redirectLocation": "Failed to retrieve redirect location",
       "redirectHost": "Apple's redirect pointed outside its own domains, so it was not followed",
       "emptyBody": "Authentication failed: server returned HTTP {{status}} with empty body",

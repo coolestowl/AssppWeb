@@ -7,6 +7,7 @@ import {
   FAILURE_PASSWORD_TOKEN_EXPIRED,
   FAILURE_SIGN_IN_REQUIRED,
 } from "./config";
+import type { DownloadStageObserver } from "./sap/client";
 import {
   DownloadError,
   bodySnippet,
@@ -27,12 +28,19 @@ export async function getDownloadInfo(
   account: Account,
   app: Software,
   externalVersionId?: string,
+  options: {
+    allowMissingDPInfo?: boolean;
+    onStage?: DownloadStageObserver;
+  } = {},
 ): Promise<{ output: DownloadOutput; updatedCookies: typeof account.cookies }> {
   const session = createDownloadSession(account, app);
 
-  const reply = await requestDownloadProduct(session, externalVersionId ?? "");
+  const reply = await requestDownloadProduct(session, externalVersionId ?? "", {
+    onStage: options.onStage,
+    requireDownloadMaterial: options.allowMissingDPInfo !== true,
+  });
 
-  return interpretReply(session, reply);
+  return interpretReply(session, reply, options.allowMissingDPInfo === true);
 }
 
 /**
@@ -77,6 +85,7 @@ function assertDownloadReply(reply: DownloadReply): void {
 async function interpretReply(
   session: DownloadSession,
   reply: DownloadReply,
+  allowMissingDPInfo = false,
 ): Promise<{ output: DownloadOutput; updatedCookies: Cookie[] }> {
   assertDownloadReply(reply);
 
@@ -88,8 +97,9 @@ async function interpretReply(
   }
 
   // A macOS package is never what another platform asked for, and the pin may have
-  // been guessed (see `versionFinder`), so refusing a `.pkg` keeps a tvOS/visionOS/iOS
-  // request from an IPA-incompatible download (the backend repeats this check).
+  // been guessed (see `versionFinder`), so refusing a `.pkg` keeps a
+  // tvOS/watchOS/visionOS/iOS request from an IPA-incompatible download (the
+  // backend repeats this check).
   if (
     session.app.platform !== "macos" &&
     /\.pkg$/i.test(url.split(/[?#]/)[0])
@@ -136,13 +146,15 @@ async function interpretReply(
     }
   }
 
-  if (session.app.platform === "macos") {
+  if (session.app.platform === "macos" && !allowMissingDPInfo) {
     // Without dpInfo the delivered package can never be opened, and nothing
     // downstream could do anything but fail — so say so before a task exists.
+    // The version-metadata path opts out: legacy Mac replies carry a readable
+    // preflightPackageURL instead of dpInfo.
     if (!dpInfo) {
       throw new DownloadError(i18n.t("errors.download.missingDPInfo"));
     }
-  } else if (sinfs.length === 0) {
+  } else if (session.app.platform !== "macos" && sinfs.length === 0) {
     throw new DownloadError(i18n.t("errors.download.noSinf"));
   }
 
@@ -160,6 +172,8 @@ async function interpretReply(
   // The id of the build Apple actually served (after any catalogue pin) — the
   // backend records it so later version queries can fall back to it.
   const externalVersionId = metadata.softwareVersionExternalIdentifier;
+  const preflightPackageURL = item.preflightPackageURL;
+  const md5 = md5FromField(item.md5);
 
   return {
     output: {
@@ -172,7 +186,12 @@ async function interpretReply(
         externalVersionId === undefined || externalVersionId === null
           ? undefined
           : String(externalVersionId),
+      preflightPackageURL:
+        typeof preflightPackageURL === "string" && preflightPackageURL !== ""
+          ? preflightPackageURL
+          : undefined,
       dpInfo,
+      md5,
       iTunesMetadata,
     },
     updatedCookies: session.cookies,
@@ -207,6 +226,30 @@ function unexpectedReply(reply: DownloadReply): string {
 function base64FromString(value: string): string {
   const bytes = new TextEncoder().encode(value);
   return base64FromBytes(bytes);
+}
+
+/**
+ * Apple's raw-package digest, in the hex form the backend verifies against.
+ * A reply names it either as a 32-character string or as the `<data>` bytes of
+ * the digest itself (the plist parser returns those as `Uint8Array`) — treating
+ * only the string form would drop the check silently on the other, and the
+ * download would then run unverified rather than fail.
+ */
+function md5FromField(value: unknown): string | undefined {
+  const bytes =
+    value instanceof Uint8Array
+      ? value
+      : value instanceof ArrayBuffer
+        ? new Uint8Array(value)
+        : null;
+  if (bytes) {
+    return bytes.length === 16
+      ? Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
+      : undefined;
+  }
+  return typeof value === "string" && /^[0-9a-fA-F]{32}$/.test(value)
+    ? value.toLowerCase()
+    : undefined;
 }
 
 /**

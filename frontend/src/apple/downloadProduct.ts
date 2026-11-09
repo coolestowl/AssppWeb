@@ -23,6 +23,8 @@ import { needsPlatformPin } from "./platform";
 import { needsVersionExchange } from "../utils/software";
 
 import {
+  ENT_DOWNLOAD_PATH,
+  FAILURE_LICENSE_NOT_FOUND,
   REDOWNLOAD_PRODUCT_PATH,
   UPDATE_PRODUCT_PATH,
   downloadDispatchEndpoint,
@@ -31,6 +33,12 @@ import {
   volumeStoreEndpoint,
   type StoreDownloadEndpoint,
 } from "./config";
+import {
+  acceptDownloadKBSync,
+  generateDownloadKBSync,
+  invalidateDownloadKBSync,
+  type DownloadStageObserver,
+} from "./sap/client";
 import i18n from "../i18n";
 
 // Error types live in `errors.ts` (importable without the libcurl graph) and are
@@ -44,6 +52,23 @@ export interface DownloadSession {
   account: Account;
   app: Software;
   cookies: Cookie[];
+}
+
+export interface DownloadRequestOptions {
+  /**
+   * Skip the preferred ent/download endpoint. Version-pin guessing probes use
+   * this so an unpinned probe cannot recursively ask for another pin.
+   */
+  legacyOnly?: boolean;
+  /** Optional, user-friendly progress stages for the exchange. */
+  onStage?: DownloadStageObserver;
+  /**
+   * Download replies must carry the material needed to install the package:
+   * a non-empty `sinf` on iOS-family builds, or `dpInfo` on macOS. Version
+   * listing and metadata lookups only need the item metadata, so they leave
+   * this off.
+   */
+  requireDownloadMaterial?: boolean;
 }
 
 export interface DownloadReply {
@@ -65,32 +90,88 @@ export function createDownloadSession(
 }
 
 /**
- * volumeStore is primary but not the only endpoint: it answers without a download
- * item for unowned apps and can report one unavailable, so the bag chains
- * redownload then updateProduct (serving pinned versions) on an empty/unavailable
- * reply — not on a failureType or message, which is a real answer returned as-is.
+ * Apple now points the bag's volumeStoreDownloadProduct key at ent/download,
+ * which requires a StoreAgent-generated kbsync. Prefer it when a pin is known;
+ * an unpinned iOS request first resolves the current build. It is only a fast
+ * path: any failure falls through to the legacy volumeStore -> redownload ->
+ * updateProduct chain, whose reply is the answer (as in ipatool).
  */
 export async function requestDownloadProduct(
   session: DownloadSession,
   pinnedVersionId: string,
+  options: DownloadRequestOptions = {},
 ): Promise<DownloadReply> {
   const { account } = session;
   const guid = account.deviceIdentifier;
 
   let externalVersionId = pinnedVersionId;
-
   // volumeStore answers by the account's device class (iOS by default), not the
-  // requested platform: an unpinned tvOS/visionOS request returns the iOS ipa, so
-  // pin that platform's version first. macOS ships under its own adam ids (no pin).
+  // requested platform: an unpinned tvOS/watchOS/visionOS request can return
+  // the iOS ipa, so pin that platform's version first. macOS pins its Mac offer
+  // from the storefront before the preferred request too.
   if (!externalVersionId && needsPlatformPin(session.app.platform)) {
-    externalVersionId = await pinnedLatestVersionId(session);
+    externalVersionId = await pinnedLatestVersionId(session, {
+      allowGuess: !options.legacyOnly,
+    });
+  }
+
+  // fetchBag already degrades to the default auth URL on failure; a thrown
+  // error here means its mocked/transport contract changed, so leave the bag
+  // unset and let the legacy chain make its own attempt.
+  let bag: Awaited<ReturnType<typeof fetchBag>> | null = options.legacyOnly
+    ? null
+    : await fetchBag(guid).catch(() => null);
+  let volumeStoreReply: DownloadReply | null = null;
+
+  if (bag?.entDownloadEndpoint) {
+    let preferredVersionId = externalVersionId;
+    if (!preferredVersionId) {
+      try {
+        preferredVersionId = await pinnedLatestVersionId(session, {
+          allowGuess: !options.legacyOnly,
+        });
+      } catch {
+        // Preserve the legacy volumeStore path when the catalogue cannot pin.
+      }
+    }
+
+    if (preferredVersionId) {
+      try {
+        const endpoint = dispatchEndpoint(
+          bag.entDownloadEndpoint,
+          ENT_DOWNLOAD_PATH,
+          guid,
+        );
+        const reply = await sendEntDownload(
+          session,
+          endpoint,
+          preferredVersionId,
+          options.onStage,
+        );
+        if (
+          options.requireDownloadMaterial &&
+          !hasDownloadMaterial(reply, session.app.platform)
+        ) {
+          throw new UnexpectedAppleResponseError(reply.status, bodySnippet(reply.body));
+        }
+        return reply;
+      } catch {
+        options.onStage?.(null);
+        // Match ipatool: generation, transport, endpoint validation and reply
+        // shape failures all fall through to the legacy chain, which answers
+        // for the app. ent/download is an optional fast path, so its error must
+        // not outrank a working legacy download or mask the legacy failure.
+        console.warn(
+          `[download] ent/download unavailable, trying legacy endpoints for ${session.app.id}`,
+        );
+      }
+    }
   }
 
   // A request Apple never answered (the storefront host's address pool is the
   // one that goes silent; see AGENTS.md) says nothing about this endpoint, and the
   // fallbacks live on another host, so the next one is a real alternative; anything
   // Apple *answered* stays with the shape checks below.
-  let volumeStoreReply: DownloadReply | null = null;
   let volumeStoreFailure: unknown;
   try {
     volumeStoreReply = await sendDownloadRequest(
@@ -103,15 +184,31 @@ export async function requestDownloadProduct(
     volumeStoreFailure = error;
   }
 
-  if (
-    volumeStoreReply &&
-    !isEmptyDownloadResponse(volumeStoreReply) &&
-    !isUnavailableDownloadResponse(volumeStoreReply)
-  ) {
-    return volumeStoreReply;
+  if (volumeStoreReply) {
+    const failureType = failureTypeOf(volumeStoreReply);
+    const message = customerMessageOf(volumeStoreReply);
+
+    // A reply with a structured failure is Apple's answer, not evidence that this
+    // host cannot serve the app. Only the empty/unavailable shapes are endpoint
+    // misses; letting a 2034 or 9610 fall through would hide the session or
+    // licence signal behind an unrelated fallback error. "No Longer Available"
+    // is the one message-only shape that is an endpoint miss.
+    if (
+      failureType !== "" ||
+      (message !== "" && !isUnavailableDownloadResponse(volumeStoreReply))
+    ) {
+      return volumeStoreReply;
+    }
+
+    const usable =
+      !isEmptyDownloadResponse(volumeStoreReply) &&
+      !isUnavailableDownloadResponse(volumeStoreReply) &&
+      (!options.requireDownloadMaterial ||
+        hasDownloadMaterial(volumeStoreReply, session.app.platform));
+    if (usable) return volumeStoreReply;
   }
 
-  const bag = await fetchBag(guid);
+  bag ??= await fetchBag(guid);
   // Nothing advertised to fall back to: report what volumeStore said — or, when
   // it never got through, the transport failure itself.
   if (!bag.redownloadEndpoint) {
@@ -130,7 +227,9 @@ export async function requestDownloadProduct(
   // exactly what came back empty (or never arrived).
   if (!externalVersionId) {
     try {
-      externalVersionId = await pinnedLatestVersionId(session);
+      externalVersionId = await pinnedLatestVersionId(session, {
+        allowGuess: !options.legacyOnly,
+      });
     } catch (error) {
       // Reached only while recovering: if volumeStore never answered, the pin
       // lookup fails for the same reason, so report that real failure instead of
@@ -156,24 +255,226 @@ export async function requestDownloadProduct(
         session,
         dispatchEndpoint(bag.updateEndpoint, UPDATE_PRODUCT_PATH, guid),
         externalVersionId,
+        options.requireDownloadMaterial === true,
       );
     }
     throw error;
   }
 
+  const redownloadUnavailable = isRedownloadUnavailableReply(redownloadReply);
+  const redownloadNoLicenceFailure = () =>
+    new DownloadError(
+      i18n.t("errors.download.licenseRequired"),
+      FAILURE_LICENSE_NOT_FOUND,
+    );
+  const redownloadMissingMaterial =
+    options.requireDownloadMaterial &&
+    redownloadReply.status === 200 &&
+    failureTypeOf(redownloadReply) === "" &&
+    !hasDownloadMaterial(redownloadReply, session.app.platform);
+
   if (
     bag.updateEndpoint &&
     externalVersionId &&
-    isUnavailableDownloadResponse(redownloadReply)
+    (isUnavailableDownloadResponse(redownloadReply) ||
+      redownloadUnavailable ||
+      redownloadMissingMaterial)
   ) {
-    return sendUpdateProduct(
-      session,
-      dispatchEndpoint(bag.updateEndpoint, UPDATE_PRODUCT_PATH, guid),
-      externalVersionId,
-    );
+    try {
+      return await sendUpdateProduct(
+        session,
+        dispatchEndpoint(bag.updateEndpoint, UPDATE_PRODUCT_PATH, guid),
+        externalVersionId,
+        options.requireDownloadMaterial === true,
+      );
+    } catch (error) {
+      if (redownloadUnavailable) {
+        if (isMissingLicenceError(error)) throw error;
+        throw redownloadNoLicenceFailure();
+      }
+      throw error;
+    }
+  }
+
+  if (redownloadUnavailable) {
+    throw redownloadNoLicenceFailure();
   }
 
   return redownloadReply;
+}
+
+/**
+ * The kbsync-backed endpoint. It deliberately does not follow redirects: the
+ * request carries X-Token, which must only reach the exact Apple host the bag
+ * advertised.
+ */
+async function sendEntDownload(
+  session: DownloadSession,
+  endpoint: StoreDownloadEndpoint,
+  externalVersionId: string,
+  onStage?: DownloadStageObserver,
+): Promise<DownloadReply> {
+  const { account, app } = session;
+  const hardwareId = hexBytes(account.deviceIdentifier);
+  if (!hardwareId || hardwareId.length !== 6) {
+    throw new DownloadError("ent/download requires a six-byte device GUID");
+  }
+
+  // Mirrors ipatool's StoreAgent serialNumber derivation.
+  const serial = new Uint8Array(9);
+  serial.set([0x54, 0xc8, 0xb0, 0xa9, 0x88]);
+  serial.set(hardwareId.subarray(2), 5);
+  const serialNumber = bytesToBase64(serial);
+
+  let kbsync = await generateDownloadKBSync(
+    account.deviceIdentifier,
+    account.directoryServicesIdentifier,
+    onStage,
+  );
+  let freshBlobRetried = false;
+
+  while (true) {
+    try {
+      onStage?.({ stage: "connecting", percent: null });
+      const response = await appleRequest({
+        method: "POST",
+        host: endpoint.host,
+        path: endpoint.path,
+        headers: {
+          // ipatool mirrors Store's XMLPayload here: the header is the
+          // framework's form type even though the bytes are a plist.
+          "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+          "User-Agent":
+            "Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) AppleWebKit/0620.2.4.11.6",
+          "X-Apple-Store-Front": account.store,
+          "X-Token": account.passwordToken,
+          "iCloud-DSID": account.directoryServicesIdentifier,
+          "X-Dsid": account.directoryServicesIdentifier,
+        },
+        body: buildPlist({
+          creditDisplay: "",
+          guid: account.deviceIdentifier,
+          kbsync: kbsync.blob,
+          salableAdamId: String(app.id),
+          serialNumber,
+          externalVersionId,
+        }),
+        cookies: [...session.cookies],
+      });
+
+      const reply = toReply(response, endpoint);
+      onStage?.({ stage: "confirming", percent: null });
+
+      // A structured failure is Apple's answer about the account or app, not
+      // evidence that the kbsync blob is stale. Leave ent/download and let the
+      // legacy chain surface that answer without speculatively rebuilding the
+      // StoreAgent session.
+      if (failureTypeOf(reply) !== "" || customerMessageOf(reply) !== "") {
+        throw new DownloadError(
+          customerMessageOf(reply) ||
+            i18n.t("errors.download.downloadFailed", {
+              failureType: failureTypeOf(reply),
+            }),
+          failureTypeOf(reply) || undefined,
+        );
+      }
+
+      // Any other reply that is not the requested download is this endpoint
+      // refusing the attempt. ipatool treats it as an ent/download miss and
+      // falls through to the legacy chain. An UnexpectedAppleResponseError lets
+      // the catch below retry a cached blob once; a fresh blob is not retried.
+      if (
+        reply.status !== 200 ||
+        !entDownloadReplyMatches(reply, session.app, externalVersionId)
+      ) {
+        invalidateDownloadKBSync(
+          account.deviceIdentifier,
+          account.directoryServicesIdentifier,
+          kbsync.blob,
+        );
+        throw new UnexpectedAppleResponseError(
+          reply.status,
+          bodySnippet(reply.body),
+        );
+      }
+
+      // Only a blob Apple accepted is reused; a generated but rejected blob must
+      // be regenerated on the next attempt.
+      acceptDownloadKBSync(
+        account.deviceIdentifier,
+        account.directoryServicesIdentifier,
+        kbsync.blob,
+      );
+      // Only an accepted ent/download reply may rotate the shared session. A
+      // failed fast path must leave the legacy chain the cookies it started with.
+      session.cookies = extractAndMergeCookies(
+        response.rawHeaders,
+        session.cookies,
+      );
+      return reply;
+    } catch (error) {
+      if (!(error instanceof UnexpectedAppleResponseError)) throw error;
+
+      invalidateDownloadKBSync(
+        account.deviceIdentifier,
+        account.directoryServicesIdentifier,
+        kbsync.blob,
+      );
+
+      // ipatool retries a rejected cached blob once with a fresh one; a rejected
+      // fresh blob is not retried, since another generation cannot be trusted to
+      // differ. Cancellation and other callers' newer cache entries are left alone.
+      if (!kbsync.fromAcceptedCache || freshBlobRetried) throw error;
+      freshBlobRetried = true;
+      kbsync = await generateDownloadKBSync(
+        account.deviceIdentifier,
+        account.directoryServicesIdentifier,
+        onStage,
+      );
+    }
+  }
+}
+
+/** Whether an ent/download reply names exactly the requested downloadable build. */
+function entDownloadReplyMatches(
+  reply: DownloadReply,
+  app: Software,
+  externalVersionId: string,
+): boolean {
+  const items = itemsOf(reply);
+  const metadata = (items[0]?.metadata ?? {}) as Record<string, any>;
+  const bundleId = metadata.softwareVersionBundleId;
+
+  return (
+    items.length === 1 &&
+    String(metadata.itemId) === String(app.id) &&
+    String(metadata.softwareVersionExternalIdentifier) === externalVersionId &&
+    typeof bundleId === "string" &&
+    bundleId !== "" &&
+    (!app.bundleID || bundleId === app.bundleID) &&
+    typeof items[0].URL === "string" &&
+    items[0].URL !== ""
+  );
+}
+
+function hexBytes(value: string): Uint8Array | null {
+  if (!/^([0-9a-fA-F]{2})+$/.test(value)) {
+    return null;
+  }
+  const bytes = new Uint8Array(value.length / 2);
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+  }
+  return btoa(binary);
 }
 
 /**
@@ -184,6 +485,7 @@ async function sendUpdateProduct(
   session: DownloadSession,
   endpoint: StoreDownloadEndpoint,
   externalVersionId: string,
+  requireDownloadMaterial = false,
 ): Promise<DownloadReply> {
   const reply = await sendDownloadRequest(session, endpoint, externalVersionId);
 
@@ -211,7 +513,11 @@ async function sendUpdateProduct(
     bundleId !== "" &&
     (!session.app.bundleID || bundleId === session.app.bundleID);
 
-  if (!matchesRequestedApp) {
+  if (
+    !matchesRequestedApp ||
+    (requireDownloadMaterial &&
+      !hasDownloadMaterial(reply, session.app.platform))
+  ) {
     throw new DownloadError(i18n.t("errors.download.updateMismatch"));
   }
 
@@ -344,6 +650,28 @@ export function itemsOf(reply: DownloadReply): Record<string, any>[] {
   return Array.isArray(items) ? (items as Record<string, any>[]) : [];
 }
 
+/** Whether an item carries the material the download pipeline needs. */
+export function hasDownloadMaterial(
+  reply: DownloadReply,
+  platform: Software["platform"],
+): boolean {
+  const sinfs = itemsOf(reply)[0]?.sinfs;
+  if (!Array.isArray(sinfs)) return false;
+
+  for (const entry of sinfs) {
+    if (!entry || typeof entry !== "object") continue;
+    const field = platform === "macos" ? entry.dpInfo : entry.sinf;
+    if (field instanceof Uint8Array) {
+      if (field.byteLength > 0) return true;
+    } else if (field instanceof ArrayBuffer) {
+      if (field.byteLength > 0) return true;
+    } else if (typeof field === "string" && field !== "") {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Apple's version identifiers from a reply, newest first (Apple returns oldest
  * first); the reversal happens here so the version pickers can render in order.
@@ -395,12 +723,55 @@ function isEmptyRedownloadError(error: unknown): boolean {
   );
 }
 
+const REDOWNLOAD_UNAVAILABLE_MESSAGE =
+  "Redownload Unavailable with This Apple Account";
+const REDOWNLOAD_UNAVAILABLE_EXPLANATION =
+  "This redownload is not available for this Apple Account either because it was bought by a different user or the item was refunded or cancelled.";
+
+/** Apple's spaces in these messages include U+00A0 and U+2000–U+200A. */
+function normalizeAppleMessage(value: unknown): string {
+  return String(value ?? "")
+    .replace(/[\u00a0\u2000-\u200a\u202f\s]+/gu, " ")
+    .trim();
+}
+
+function redownloadUnavailableFields(data: Record<string, any> | null | undefined): boolean {
+  if (!data) return false;
+  return (
+    normalizeAppleMessage(data.message) === REDOWNLOAD_UNAVAILABLE_MESSAGE &&
+    normalizeAppleMessage(data.explanation) === REDOWNLOAD_UNAVAILABLE_EXPLANATION
+  );
+}
+
+/**
+ * Apple's 200-level refusal when the account has no licence for the item. The
+ * exact pair is matched: a looser "Apple Account" search could turn unrelated
+ * refusals into a purchase prompt.
+ */
+export function isRedownloadUnavailableReply(reply: DownloadReply): boolean {
+  if (reply.status === 500 || failureTypeOf(reply) !== "") return false;
+  return (
+    redownloadUnavailableFields(reply.data) ||
+    redownloadUnavailableFields(reply.data?.dialog)
+  );
+}
+
+function isMissingLicenceError(error: unknown): boolean {
+  return (
+    error instanceof DownloadError &&
+    error.code === FAILURE_LICENSE_NOT_FOUND
+  );
+}
+
 /**
  * Resolves the newest external version id redownload/updateProduct need; failure
  * is fatal here (as in ipatool) since an unpinned redownload can return a tvOS
  * build indistinguishable from the request. Delisted apps fall back to a recorded pin.
  */
-async function pinnedLatestVersionId(session: DownloadSession): Promise<string> {
+async function pinnedLatestVersionId(
+  session: DownloadSession,
+  options: { allowGuess?: boolean } = {},
+): Promise<string> {
   const country = storeIdToCountry(session.account.store) ?? "us";
   const platform = session.app.platform;
 
@@ -418,6 +789,7 @@ async function pinnedLatestVersionId(session: DownloadSession): Promise<string> 
             country,
             platform,
             session.cookies,
+            session.app.bundleID || undefined,
           ),
     session.app.id,
     platform,
@@ -426,9 +798,9 @@ async function pinnedLatestVersionId(session: DownloadSession): Promise<string> 
   if (!versionId) {
     // No catalogue offer and no recorded pin names this platform, but a
     // `local`/`bare` record is a real app, so guess a neighbour id from the iOS
-    // list (as `listVersions` does) — else a delisted tvOS/visionOS/macOS direct
+    // list (as `listVersions` does) — else a delisted tvOS/watchOS/visionOS/macOS direct
     // download fails where 「选择版本」 succeeds.
-    if (needsVersionExchange(session.app)) {
+    if (options.allowGuess !== false && needsVersionExchange(session.app)) {
       // Dynamic import breaks the cycle (`versionPinGuess` imports this module) and
       // keeps the test mock that intercepts the guess's probes working.
       const { guessPlatformPinFromIOSList } = await import("./versionPinGuess");

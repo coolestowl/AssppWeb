@@ -128,7 +128,7 @@
       "preparingAssets": "署名コンポーネントを準備中 {{percent}}%",
       "preparingSigner": "署名器を初期化中…",
       "signerFailed": "署名コンポーネントの準備に失敗しました：{{error}}",
-      "signerFirstRun": "初回のみ署名コンポーネントを準備します（約 14 MB）。",
+      "signerFirstRun": "初回のみ署名コンポーネントを準備します（約 12 MB）。",
       "retrySignIn": "サインインを再試行"
     },
     "detail": {
@@ -154,6 +154,13 @@
     }
   },
   "downloads": {
+    "progress": {
+      "preparing": "ダウンロードコンポーネントを準備しています…",
+      "preparingLabel": "ダウンロードコンポーネントを準備しています",
+      "initializing": "ダウンロードコンポーネントを初期化しています…",
+      "connecting": "App Store に接続しています…",
+      "confirming": "ダウンロード情報を確認しています…"
+    },
     "title": "ダウンロード",
     "warning": "パッケージは一時的なもので、サーバーの再起動時にクリアされます。早めにダウンロードまたはインストールしてください。",
     "warningShort": "一時保存。再起動で消去。早めに保存を。",
@@ -161,11 +168,11 @@
     "emptyAll": "ダウンロードはありません。",
     "emptyAllDesc": "ダウンロードキューは空です。検索ページに移動して、必要なアプリを探索してダウンロードしてください。",
     "emptyAllDescShort": "ダウンロードはありません。検索でアプリを探せます。",
-    "emptyFilter": "{{status}} のダウンロードはありません。",
-    "emptyFilterDesc": "このステータスに一致するダウンロード記録はありません。",
-      "filter": "フィルター",
-      "statusWithCount": "{{status}} ({{count}})",
-      "filterActive": "進行中",
+    "emptyFilter": "{{account}} のダウンロードはありません。",
+    "emptyFilterDesc": "このアカウントに一致するダウンロード記録はありません。",
+    "accountFilter": "アカウントで絞り込む",
+    "accountWithCount": "{{account}} ({{count}})",
+    "allAccounts": "すべてのアカウント",
     "searchApps": "ダウンロードするアプリを検索",
     "deleteConfirm": "このダウンロードを削除しますか？",
     "deletePrompt": "{{appName}} を削除しますか？この操作は元に戻せません。パッケージはサーバーから削除されます。",
@@ -494,6 +501,7 @@
     "auth": {
       "requiresVerification": "2ファクタ認証コードが必要です。ポップアップが出ない場合は、https://account.apple.com でサインインしてアラートをトリガーし、コード欄に入力してください。",
       "verificationIncomplete": "Apple による確認が完了しませんでした。新しい確認コードを取得して、もう一度入力してください。",
+      "invalidCode": "2ファクタ認証コードは6桁の数字で入力してください。",
       "redirectLocation": "リダイレクト先を取得できませんでした",
       "redirectHost": "Apple のリダイレクト先が Apple のドメイン外だったため、追跡しませんでした",
       "emptyBody": "認証失敗: サーバーが空のボディでHTTP {{status}}を返しました",
